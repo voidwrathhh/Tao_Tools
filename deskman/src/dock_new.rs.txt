@@ -1,0 +1,267 @@
+/// 底部 Dock 滑轨：回环轮盘（环形）与经典条状两种形态
+fn render_dock(ctx: &egui::Context, app: &mut DeskmanApp) {
+    if !app.config.dock.enabled || app.config.dock.items.is_empty() {
+        return;
+    }
+    let theme = app.panel_theme();
+    let icon_size = app.config.dock.icon_size.clamp(28.0, 96.0);
+    let magnify = app.config.dock.magnify.clamp(1.0, 3.0);
+    let gap = icon_size * 0.22;
+    let pad = gap.max(8.0);
+    let n = app.config.dock.items.len();
+    let screen = ctx.screen_rect();
+    let items = app.config.dock.items.clone();
+    let loop_mode = app.config.dock.loop_mode;
+    let pointer = ctx.input(|i| i.pointer.hover_pos());
+
+    let (bar_rect, max_scroll) = if loop_mode {
+        let a = ((n as f32) * (icon_size + gap) * 0.5)
+            .min(screen.width() * 0.46)
+            .max(240.0);
+        let base_y = screen.bottom() - icon_size * 0.9 - 12.0;
+        (
+            Rect::from_min_size(
+                Pos2::new(screen.center().x - a, base_y - icon_size * 2.4),
+                Vec2::new(a * 2.0, icon_size * 2.8),
+            ),
+            f32::INFINITY,
+        )
+    } else {
+        let content_w = pad * 2.0 + n as f32 * icon_size + (n as f32 - 1.0).max(0.0) * gap;
+        let max_w = screen.width() - 120.0;
+        let bar_w = content_w.min(max_w).max(120.0);
+        let max_scroll = (content_w - bar_w).max(0.0);
+        let reflect_h = if app.config.dock.reflection {
+            icon_size * 0.45
+        } else {
+            0.0
+        };
+        let bar_h = icon_size + reflect_h + pad * 2.0;
+        (
+            Rect::from_min_size(
+                Pos2::new(screen.center().x - bar_w / 2.0, screen.bottom() - bar_h - 10.0),
+                Vec2::new(bar_w, bar_h),
+            ),
+            max_scroll,
+        )
+    };
+
+    // 滚动输入：回环模式写入旋转量（可无限环绕），条状模式写入平移目标
+    let dock_hit = ctx.interact(
+        bar_rect,
+        Id::new("dock_hit_zone"),
+        Sense::click_and_drag(),
+    );
+    let wheel = ctx.input(|i| i.raw_scroll_delta);
+    if dock_hit.hovered() {
+        let d = (wheel.x + wheel.y) * 1.2;
+        if loop_mode {
+            app.dock_spin += d;
+        } else {
+            app.dock_scroll_target = (app.dock_scroll_target - d).clamp(0.0, max_scroll);
+        }
+    }
+    if dock_hit.dragged() {
+        let dx = ctx.input(|i| i.pointer.delta().x);
+        if loop_mode {
+            app.dock_spin -= dx;
+        } else {
+            app.dock_scroll_target = (app.dock_scroll_target - dx).clamp(0.0, max_scroll);
+            app.dock_scroll = app.dock_scroll_target;
+        }
+    }
+
+    // 逐图标目标缩放
+    let mut targets = vec![1.0_f32; n];
+    let mut places: Vec<(egui::Rect, f32, f32)> = vec![
+        (Rect::from_min_size(Pos2::ZERO, Vec2::ONE), 1.0, 1.0);
+        n
+    ];
+
+    if loop_mode {
+        // ---- 回环轮盘：椭圆轨道，滚动即旋转，无缝环绕 ----
+        let a = ((n as f32) * (icon_size + gap) * 0.5)
+            .min(screen.width() * 0.46)
+            .max(240.0);
+        let b = icon_size * 0.95;
+        let cx = screen.center().x;
+        let base_y = screen.bottom() - icon_size * 0.9 - 12.0;
+        let step = std::f32::consts::TAU / n as f32;
+        let offset = app.dock_spin / (icon_size + gap) * step;
+        let px = pointer.unwrap_or(Pos2::new(-9999.0, -9999.0)).x;
+        let sigma = icon_size * 2.2;
+
+        for i in 0..n {
+            let theta = offset + i as f32 * step;
+            let (sin_t, cos_t) = theta.sin_cos();
+            let depth = (sin_t + 1.0) * 0.5; // 0 最远 1 最近
+            let x = cx + a * cos_t;
+            let y = base_y - (1.0 - depth) * b;
+            let mut scale = 0.45 + 0.85 * depth;
+            if depth > 0.55 {
+                let d = (px - x).abs();
+                scale += (magnify - 1.0) * (-(d * d) / (sigma * sigma)).exp() * depth;
+            }
+            targets[i] = scale;
+            let alpha = 0.30 + 0.70 * depth;
+            places[i] = (
+                Rect::from_center_size(
+                    Pos2::new(x, y - icon_size * scale / 2.0),
+                    Vec2::new(icon_size * scale, icon_size * scale),
+                ),
+                alpha,
+                depth,
+            );
+        }
+
+        // 底部托板
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            Id::new("dock_loop_shelf"),
+        ));
+        let shelf_w = (a * 1.9).min(screen.width() - 60.0);
+        let shelf_h = icon_size * 0.52;
+        let shelf_rect = Rect::from_center_size(
+            Pos2::new(cx, base_y - shelf_h / 2.0 + 2.0),
+            Vec2::new(shelf_w, shelf_h),
+        );
+        let opacity = app.config.dock.opacity.clamp(0.0, 1.0);
+        if opacity > 0.01 {
+            let d_alpha = (opacity * 255.0) as u8;
+            let (r, g, b) = theme.panel_rgb;
+            painter.rect_filled(
+                shelf_rect,
+                CornerRadius::same((shelf_h / 2.0) as u8),
+                Color32::from_rgba_premultiplied(
+                    (r as u32 * d_alpha as u32 / 255) as u8,
+                    (g as u32 * d_alpha as u32 / 255) as u8,
+                    (b as u32 * d_alpha as u32 / 255) as u8,
+                    d_alpha,
+                ),
+            );
+            painter.rect_stroke(
+                shelf_rect,
+                CornerRadius::same((shelf_h / 2.0) as u8),
+                Stroke::new(1.0, theme.stroke),
+                egui::epaint::StrokeKind::Inside,
+            );
+        }
+    } else {
+        // ---- 经典条状：线性排布 + 指针波浪 ----
+        let scroll = app.dock_scroll;
+        let px = pointer.unwrap_or(Pos2::new(-9999.0, -9999.0)).x - bar_rect.left();
+        let sigma = icon_size * 1.5;
+        let mut x = pad - scroll;
+        for i in 0..n {
+            let center_base = pad + i as f32 * (icon_size + gap) + icon_size / 2.0 - scroll;
+            let d = (px - center_base).abs();
+            targets[i] = 1.0 + (magnify - 1.0) * (-(d * d) / (sigma * sigma)).exp();
+            let w = icon_size * targets[i];
+            places[i] = (
+                Rect::from_min_size(
+                    Pos2::new(bar_rect.left() + x, bar_rect.top() + pad),
+                    Vec2::new(w, icon_size),
+                ),
+                1.0,
+                1.0,
+            );
+            x += w + gap;
+        }
+    }
+
+    // 平滑插值 + 动画检测（修复移开鼠标后的恢复卡顿）
+    let mut animating = false;
+    for i in 0..n {
+        let diff = targets[i] - app.dock_scales[i];
+        if diff.abs() > 0.005 {
+            animating = true;
+        }
+        app.dock_scales[i] += diff * 0.3;
+    }
+    if animating {
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+
+    // 绘制：按深度从远到近
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        Id::new("deskman_dock_icons"),
+    ));
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|a, b| {
+        places[*a]
+            .2
+            .partial_cmp(&places[*b].2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for i in order {
+        let (icon_rect, alpha, depth) = places[i];
+        let alpha_byte = (alpha * 255.0) as u8;
+        let item = &items[i];
+        let icon_response = ctx
+            .interact(icon_rect, Id::new(("dock_icon", i)), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text(&item.name);
+
+        let real_icon = app.icon_texture(ctx, item);
+        if let Some(texture) = real_icon {
+            painter.image(
+                texture.id(),
+                icon_rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::from_rgba_premultiplied(255, 255, 255, alpha_byte),
+            );
+            if app.config.dock.reflection && depth > 0.5 {
+                let refl_h = icon_rect.height() * 0.5;
+                let refl = Rect::from_min_max(
+                    Pos2::new(
+                        icon_rect.left() + icon_rect.width() * 0.06,
+                        icon_rect.bottom() + 2.0,
+                    ),
+                    Pos2::new(
+                        icon_rect.right() - icon_rect.width() * 0.06,
+                        icon_rect.bottom() + 2.0 + refl_h,
+                    ),
+                );
+                painter.image(
+                    texture.id(),
+                    refl,
+                    Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.0)),
+                    Color32::from_rgba_premultiplied(
+                        255,
+                        255,
+                        255,
+                        (alpha_byte as u32 * 70 / 255) as u8,
+                    ),
+                );
+            }
+        } else {
+            let (_, kind_color) = desktop::item_badge(&item.kind);
+            let base = Color32::from_rgba_premultiplied(
+                (kind_color.0 as u32 * alpha_byte as u32 / 255) as u8,
+                (kind_color.1 as u32 * alpha_byte as u32 / 255) as u8,
+                (kind_color.2 as u32 * alpha_byte as u32 / 255) as u8,
+                alpha_byte,
+            );
+            painter.rect_filled(
+                icon_rect,
+                CornerRadius::same((icon_rect.width() * 0.24) as u8),
+                base,
+            );
+        }
+
+        if icon_response.clicked() {
+            match desktop::open_item(item) {
+                Ok(()) => app.set_status(format!("已打开：{}", item.name)),
+                Err(e) => app.set_status(format!("打开失败：{}", e)),
+            }
+        }
+        if icon_response.secondary_clicked() {
+            app.dock_menu = Some((icon_response.clone(), i));
+        }
+    }
+
+    app.interactive_rects.push(bar_rect);
+}
+

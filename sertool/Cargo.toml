@@ -1,0 +1,10 @@
+[package]
+name = "sertool"
+version = "2.3.0"
+edition = "2021"
+description = "串口终端工具 - 扫描串口、连接通信、收发数据"
+
+[dependencies]
+serialport = "4"
+ratatui = "0.29"
+crossterm = "0.28"
