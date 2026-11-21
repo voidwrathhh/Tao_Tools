@@ -1,0 +1,16 @@
+[package]
+name = "toolhub"
+version = "1.0.0"
+edition = "2021"
+description = "Tao Tools 工具中心 - 工具快捷入口、排序与设置直达"
+
+[dependencies]
+dirs = "5"
+eframe = { version = "0.31", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "wgpu",
+] }
+egui = "0.31"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

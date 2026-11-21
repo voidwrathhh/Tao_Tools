@@ -1,4 +1,5 @@
-﻿[workspace]
+[workspace]
 resolver = "2"
-members = ["sertool", "friend", "blueinfo", "deskman"]
+members = ["sertool", "friend", "blueinfo", "deskman", "copilotkey", "toolhub"]
 default-members = ["blueinfo"]
+

@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "tools": [
+    {
+      "id": "blueinfo",
+      "title": "通用桌面蓝牙调试工具",
+      "description": "串口蓝牙通信、实时数据曲线、参数调试面板",
+      "version": "1.0.0",
+      "kind": "gui",
+      "launch": ["bluetooth-info"],
+      "settings": [],
+      "console": false,
+      "readme": "blueinfo/README.md"
+    },
+    {
+      "id": "deskman",
+      "title": "桌面快捷方式分类整理器",
+      "description": "接管桌面图标、分类面板、Dock 滑轨与真实图标",
+      "version": "4.2.1",
+      "kind": "gui",
+      "launch": ["gui"],
+      "settings": [],
+      "console": false,
+      "readme": "deskman/README.md"
+    },
+    {
+      "id": "sertool",
+      "title": "串口终端工具",
+      "description": "扫描串口、TUI 收发数据、HEX 模式与断线重连",
+      "version": "2.3.0",
+      "kind": "tui",
+      "launch": [],
+      "settings": [],
+      "console": true,
+      "readme": "sertool/README.md"
+    },
+    {
+      "id": "copilotkey",
+      "title": "Copilot 键改造工具",
+      "description": "把 Copilot 键变成全局功能键：吞掉按键、启动自定义目标、开机自启",
+      "version": "1.0.0",
+      "kind": "cli",
+      "launch": ["status"],
+      "settings": ["status"],
+      "console": true,
+      "readme": "copilotkey/README.md"
+    },
+    {
+      "id": "friend",
+      "title": "AI 聊天助手",
+      "description": "自定义 OpenAI 兼容 API、人格设定与终端对话",
+      "version": "1.0.0",
+      "kind": "cli",
+      "launch": [],
+      "settings": ["--edit-config"],
+      "console": true,
+      "readme": "friend/README.md"
+    },
+    {
+      "id": "copilotkey",
+      "title": "Copilot 键改造工具",
+      "description": "把 Copilot 键变成全局自定义功能键，按下即启动指定程序",
+      "version": "1.0.0",
+      "kind": "cli",
+      "launch": [],
+      "settings": [],
+      "console": true,
+      "readme": "copilotkey/README.md"
+    }
+  ]
+}
