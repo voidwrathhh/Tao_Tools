@@ -1,6 +1,6 @@
 [package]
 name = "copilotkey"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Copilot 键改造工具：把 Copilot 键变成全局自定义功能键"
 

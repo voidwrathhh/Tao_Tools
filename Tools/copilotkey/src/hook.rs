@@ -197,21 +197,25 @@ pub fn run(config: Config) -> i32 {
     // 启动线程：钩子回调只负责投递信号，真正的启动动作在这里做。
     let (launch_tx, launch_rx) = mpsc::channel::<()>();
     let _ = LAUNCH_TX.set(launch_tx);
-    let worker_config = config.clone();
     thread::spawn(move || {
         for _ in launch_rx {
-            let snapshot = worker_config.clone();
-            thread::spawn(move || match launch::launch(&snapshot) {
-                Ok(()) => util::log(&format!(
-                    "触发 → 启动 {}{}",
-                    snapshot.target,
-                    if snapshot.arguments.is_empty() {
-                        String::new()
-                    } else {
-                        format!("（参数：{}）", snapshot.arguments)
-                    }
-                )),
-                Err(err) => util::log(&format!("触发 → 失败：{}", err)),
+            // 每次触发都重新读一遍配置：改完目标 / 参数不用重启守护进程。
+            let snapshot = Config::load();
+            thread::spawn(move || {
+                let target = snapshot.target.clone();
+                let args = snapshot.arguments.clone();
+                match launch::launch(&snapshot) {
+                    Ok(()) => util::log(&format!(
+                        "触发 → 启动 {}{}",
+                        target,
+                        if args.is_empty() {
+                            String::new()
+                        } else {
+                            format!("（参数：{}）", args)
+                        }
+                    )),
+                    Err(err) => util::log(&format!("触发 → 失败：{}", err)),
+                }
             });
         }
     });

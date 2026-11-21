@@ -44,7 +44,7 @@ sertool connect COM3
 | [friend](Tools/friend/) | v1.0.0 | AI 聊天助手（自定义 API、人格训练） |
 | [blueinfo](Tools/blueinfo/) | v1.1.0 | 通用桌面蓝牙调试工具（GUI 图形界面，含设置界面） |
 | [deskman](Tools/deskman/) | v4.3.0 | 桌面接管式图标整理器（真实图标 + 原位还原，含设置界面） |
-| [copilotkey](Tools/copilotkey/) | v1.0.0 | Copilot 键改造工具（Windows，把 Copilot 键变成全局功能键） |
+| [copilotkey](Tools/copilotkey/) | v1.0.1 | Copilot 键改造工具（Windows，把 Copilot 键变成全局功能键） |
 | [toolhub](Tools/toolhub/) | v1.0.2 | 工具中心（图形入口：启动工具、调整顺序、直达各工具设置） |
 
 > **注册约定（强制）**：每新增一个工具，都必须在 [Tools/toolhub/registry.json](Tools/toolhub/registry.json) 中登记，否则工具中心里看不到它。字段与流程见 [Tools/toolhub/README.md](Tools/toolhub/README.md)。

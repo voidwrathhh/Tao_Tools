@@ -1,4 +1,4 @@
-﻿# copilotkey - Copilot 键改造工具
+# copilotkey - Copilot 键改造工具
 
 ## 简介
 
@@ -7,7 +7,7 @@
 
 ## 版本
 
-v1.0.0（与 `Cargo.toml` 保持一致）
+v1.0.1（与 `Cargo.toml` 保持一致）
 
 ## 原理
 
@@ -87,6 +87,7 @@ copilotkey uninstall
 ## 开发进度
 
 - [x] v1.0.0：钩子截获 + 目标启动 + 开机自启 + trace/learn/set/target/status/test 全套命令
+- [x] v1.0.1：适配 `Tools/` 新布局（按 `[workspace]` 标记自动探测仓库根）、`target` 解析失败显式告警、守护进程热重载配置（改目标不用重启）
 - [x] 真机验证（ASUS TX Gaming FA608PM）：Copilot 键确实上报 `Win+Shift+F23`，按下后启动目标程序、搜索面板不再出现
 - [x] 本机已配置：目标为 `toolhub.exe`（工具中心），开机自启已注册，守护进程常驻
 - [ ] 待做：多动作映射、长按/双击区分、图形化配置（见上面功能列表未勾选项）
@@ -99,6 +100,12 @@ copilotkey uninstall
 - 无需管理员权限；无需额外系统组件
 
 ## 更新历史
+
+### v1.0.1
+
+- 修复：适配仓库 `Tools/` 新布局 —— 仓库根改为按 `[workspace]` 标记向上探测（exe 路径 → 当前目录 → 已知兜底路径），仓库整体搬家后 `target <工具名>` 不再失效
+- 修复：守护进程热重载配置 —— 每次触发重新读取 `config.json`，改完目标 / 参数立即生效，无需重启守护进程
+- 改进：`target` 未能把名字解析成已编译 exe 时打印告警，不再静默存下裸名字（按下按键才发现启动失败）
 
 ### v1.0.0
 

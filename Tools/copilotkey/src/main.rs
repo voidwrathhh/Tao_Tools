@@ -252,6 +252,18 @@ fn cmd_target(args: &[String]) -> i32 {
     }
     if resolved != raw_target {
         out!("（“{}” 已解析为上面的完整路径）\n", raw_target);
+    } else {
+        // 看着像工具名却没解析出来（没有路径分隔符、不是 .exe / URL），提醒一下。
+        let looks_like_tool = !raw_target.contains('\\')
+            && !raw_target.contains('/')
+            && !raw_target.contains(':')
+            && !raw_target.to_lowercase().ends_with(".exe");
+        if looks_like_tool {
+            out!(
+                "注意：“{}” 没能解析成已编译的可执行文件，按下按键时会启动失败。\n用 copilotkey target --list 看看可用的工具，或直接写完整路径。\n",
+                raw_target
+            );
+        }
     }
     if hook::is_running() {
         out!("守护进程会立即使用新目标，无需重启。\n");
@@ -406,19 +418,44 @@ fn spawn_daemon(exe: &Path) -> std::io::Result<()> {
         .map(|_| ())
 }
 
-/// 找出 tao_tools 仓库根目录。
+/// 判断某个目录是不是 cargo workspace 根（Cargo.toml 里带 `[workspace]`）。
+fn is_workspace_root(dir: &Path) -> bool {
+    matches!(
+        std::fs::read_to_string(dir.join("Cargo.toml")),
+        Ok(text) if text.contains("[workspace]")
+    )
+}
+
+/// 找出 tao_tools 的 workspace 目录（工具都在它的子目录里）。
+///
+/// 依次尝试：可执行文件所在目录往上（`<workspace>\target\<profile>\exe`）、
+/// 当前目录往上（含旧布局 `<仓库>\Tools\Cargo.toml`）、最后是常见安装路径。
 fn repo_root() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
-        // <仓库>\target\<profile>\copilotkey.exe
-        if let Some(root) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
-            if root.join("Cargo.toml").exists() {
-                return Some(root.to_path_buf());
+        for dir in exe.ancestors().skip(1).take(4) {
+            if is_workspace_root(dir) {
+                return Some(dir.to_path_buf());
             }
         }
     }
-    for candidate in [r"D:\File_Data\Tao_Tools", r"E:\File_Data\Tao_Tools"] {
+    if let Ok(cwd) = std::env::current_dir() {
+        for dir in cwd.ancestors().take(6) {
+            if is_workspace_root(dir) {
+                return Some(dir.to_path_buf());
+            }
+            if is_workspace_root(&dir.join("Tools")) {
+                return Some(dir.join("Tools"));
+            }
+        }
+    }
+    for candidate in [
+        r"D:\File_Data\Tao_Tools\Tools",
+        r"D:\File_Data\Tao_Tools",
+        r"E:\File_Data\Tao_Tools\Tools",
+        r"E:\File_Data\Tao_Tools",
+    ] {
         let path = PathBuf::from(candidate);
-        if path.join("Cargo.toml").exists() {
+        if is_workspace_root(&path) {
             return Some(path);
         }
     }
