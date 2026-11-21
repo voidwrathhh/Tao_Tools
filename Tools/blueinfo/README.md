@@ -25,13 +25,10 @@
 ### 启动图形界面
 
 ```bash
-# 从项目根目录启动
-cargo run -- bluetooth-info
-
-# 或指定 blueinfo 包
+# 在 Tools/ 目录下启动
 cargo run -p blueinfo -- bluetooth-info
 
-# 安装到全局后
+# 安装到全局（在 Tools/ 目录下执行）
 cargo install --path blueinfo
 blueinfo bluetooth-info
 ```
@@ -123,15 +120,6 @@ void send_blue_packet(int fd, double timestamp, double* data, int count) {
 - Rust 2021 edition+
 - 操作系统：Windows / Linux / macOS
 - 串口硬件驱动（系统自带，USB 蓝牙模块自动虚拟串口）
-
-## 开发计划
-
-- [ ] BLE 低功耗蓝牙接口（btleplug 集成）
-- [ ] 串口参数配置面板（数据/停止/校验位）
-- [ ] 曲线截图保存到本地
-- [ ] 多语言界面切换
-- [ ] 历史配置导入导出（跨设备）
-- [ ] 数据回放功能
 
 ## 开发规范
 

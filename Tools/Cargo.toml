@@ -1,4 +1,6 @@
-﻿[workspace]
+[workspace]
 resolver = "2"
 members = ["sertool", "friend", "blueinfo", "deskman", "copilotkey", "toolhub"]
-default-members = ["blueinfo"]
+
+# 不设 default-members：在 Tools/ 目录下 `cargo build` / `cargo check` 默认覆盖全部工具，
+# 避免只编某一个工具导致漏编；单工具用 `cargo build -p <工具>`，`cargo run` 也必须带 `-p`。

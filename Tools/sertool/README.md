@@ -28,8 +28,11 @@ v2.4.0
 ## 安装
 
 ```bash
-# 从源码安装（项目根目录或 sertool 目录下执行）
-cargo install --path .
+# 在 Tools/ 目录下执行
+cargo install --path sertool
+
+# 或在仓库根目录执行
+cargo install --path Tools/sertool
 
 # 验证安装
 sertool --version

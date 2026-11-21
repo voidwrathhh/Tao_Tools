@@ -171,6 +171,7 @@ cargo run -p deskman -- tools readme sertool
 安装后可直接使用：
 
 ```bash
+# 在 Tools/ 目录下执行
 cargo install --path deskman
 deskman gui
 deskman settings

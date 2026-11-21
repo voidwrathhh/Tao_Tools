@@ -97,6 +97,7 @@ AI: 哦，发生什么事了？
 ## 安装
 
 ```bash
+# 在 Tools/ 目录下执行
 cargo install --path friend
 ```
 
