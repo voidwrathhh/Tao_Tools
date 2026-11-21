@@ -93,6 +93,29 @@ AI: 哦，发生什么事了？
 
 - Rust 2021 edition+
 - 一个兼容 OpenAI Chat API 的 AI 服务（DeepSeek、OpenAI、Groq 等）
+- Windows + MSVC 工具链下，`ring`（`ureq` 的 TLS 依赖）**首次从零编译**时要求 cl.exe 能写 `%TEMP%`
+
+### Windows/MSVC：ring 编译报 D8050
+
+从零编译 `ring` 时可能失败，cl.exe 报：
+
+```
+cl : Command line error D8050 : cannot execute '...\c1.dll': failed to get command line into debug records
+```
+
+原因：cc-rs 给 cl 传 `/Z7`（debuginfo）并配合 `/Brepro`，`/Z7` 下 cl 需要往 `%TEMP%` 写临时文件；一旦构建子进程写不了 `%TEMP%`（受限令牌 / 低完整性沙箱、`TEMP` 指向不存在或只读目录、路径含非 ASCII 等），cl 就以 D8050 报出来。**这不是 MSVC 组件损坏、ring 版本或本工具源码的问题**——同一条 cl 命令行在普通终端里能正常编过，只有由 cargo/cc-rs 拉起时才失败。
+
+实测有效的绕开方式（任选其一，都不改源码、不动 workspace 清单）：
+
+| 方式 | 命令（在 `Tools/` 下） | 说明 |
+|---|---|---|
+| release 构建 | `cargo build -p friend --release` | 无 debuginfo，不触发 `/Z7`，最省事 |
+| 关掉 dev profile 的 debuginfo | `CARGO_PROFILE_DEV_DEBUG=0 cargo build -p friend` | dev 构建仍可用，只是无调试信息 |
+| 把临时目录指到可写位置 | `$env:TEMP=$env:TMP='<可写目录>'; cargo build -p friend` | 想保留 dev + debuginfo 时用 |
+
+注意：`RUSTFLAGS='-C debuginfo=0'` **无效**。ring 的 C 编译看的是 cargo 传给构建脚本的 `DEBUG` 环境变量（profile 级），与 rustc 的 debuginfo 选项无关，`/Z7` 照样会加上，仍报 D8050。
+
+普通（Medium 完整性）终端一般不会遇到此问题，多见于 IDE/沙箱/受限令牌下调起的构建。
 
 ## 安装
 
