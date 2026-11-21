@@ -20,7 +20,7 @@ sertool connect COM3
 | [sertool](sertool/) | v2.3.0 | 串口终端工具（TUI 界面） |
 | [friend](friend/) | v1.0.0 | AI 聊天助手（自定义 API、人格训练） |
 | [blueinfo](blueinfo/) | v1.0.0 | 通用桌面蓝牙调试工具（GUI 图形界面） |
-| [deskman](deskman/) | v4.2.1 | 桌面接管式图标整理器（真实图标 + 原位还原） |
+| [deskman](deskman/) | v4.3.0 | 桌面接管式图标整理器（真实图标 + 原位还原） |
 | [copilotkey](copilotkey/) | v1.0.0 | Copilot 键改造工具（Windows，把 Copilot 键变成全局功能键） |
 | [toolhub](toolhub/) | v1.0.0 | 工具中心（图形入口：启动工具、调整顺序、直达 README） |
 

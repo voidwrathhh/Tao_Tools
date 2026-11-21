@@ -1,4 +1,4 @@
-{
+﻿{
   "schema": 1,
   "tools": [
     {
@@ -16,10 +16,10 @@
       "id": "deskman",
       "title": "桌面快捷方式分类整理器",
       "description": "接管桌面图标、分类面板、Dock 滑轨与真实图标",
-      "version": "4.2.1",
+      "version": "4.3.0",
       "kind": "gui",
       "launch": ["gui"],
-      "settings": [],
+      "settings": ["settings"],
       "console": false,
       "readme": "deskman/README.md"
     },
