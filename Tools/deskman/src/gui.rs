@@ -478,8 +478,14 @@ impl eframe::App for DeskmanApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
-    fn on_exit(&mut self) {
-        // 设置模式没有接管桌面，不能恢复桌面状态
+}
+
+impl Drop for DeskmanApp {
+    fn drop(&mut self) {
+        // 退出兜底还原：设置模式没有接管桌面，不能恢复桌面状态。
+        // 放在 Drop 而不是 eframe::App::on_exit：on_exit 的签名由 eframe 的 `glow`
+        // feature 决定（开 glow 为 2 参数、关 glow 为 1 参数），workspace 全量构建时
+        // 其它成员把 glow 统一打开，单参数重写会触发 E0050；Drop 与 feature 组合无关。
         if !self.settings_only {
             exit_restore(&mut self.state);
         }
