@@ -20,6 +20,7 @@ fn main() {
 
     match args[1].as_str() {
         "gui" => gui::run(),
+        "settings" => gui::run_settings(),
         "config" => println!("{}", config::config_path().display()),
         "scan" => handle_scan(),
         "list-desktop" => handle_list_desktop(),
@@ -197,6 +198,10 @@ fn print_usage() {
     println!("用法：");
     println!(
         "  {} gui                              启动桌面常驻分类界面",
+        APP_NAME
+    );
+    println!(
+        "  {} settings                         只打开设置窗口（不接管桌面）",
         APP_NAME
     );
     println!(

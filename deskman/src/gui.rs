@@ -26,25 +26,42 @@ const SHADOW: egui::epaint::Shadow = egui::epaint::Shadow {
 };
 
 pub fn run() {
+    run_impl(false);
+}
+
+/// 只打开设置窗口：供 toolhub 等外部入口“设置直达”使用，
+/// 不接管桌面、不启动托盘、退出时不恢复桌面图标。
+pub fn run_settings() {
+    run_impl(true);
+}
+
+fn run_impl(settings_only: bool) {
     let mut config = AppConfig::load();
-    if config.scan.show_unclassified {
+    if !settings_only && config.scan.show_unclassified {
         if desktop::scan_into_config(&mut config).unwrap_or(0) > 0 {
             config.save();
         }
     }
 
-    let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([config.desktop.width, config.desktop.height])
-        .with_decorations(false)
-        .with_transparent(true)
-        .with_resizable(false)
-        .with_title_shown(false)
-        .with_titlebar_shown(false)
-        .with_close_button(false)
-        .with_minimize_button(false)
-        .with_maximize_button(false)
-        .with_taskbar(false)
-        .with_title("Deskman");
+    let viewport = if settings_only {
+        egui::ViewportBuilder::default()
+            .with_inner_size([620.0, 760.0])
+            .with_min_inner_size([480.0, 520.0])
+            .with_title("Deskman 设置")
+    } else {
+        egui::ViewportBuilder::default()
+            .with_inner_size([config.desktop.width, config.desktop.height])
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_resizable(false)
+            .with_title_shown(false)
+            .with_titlebar_shown(false)
+            .with_close_button(false)
+            .with_minimize_button(false)
+            .with_maximize_button(false)
+            .with_taskbar(false)
+            .with_title("Deskman")
+    };
 
     let options = eframe::NativeOptions {
         viewport,
@@ -54,14 +71,16 @@ pub fn run() {
     };
 
     let tray = TrayController::new();
-    if let Err(e) = tray::start(tray.clone()) {
-        eprintln!("警告：托盘初始化失败: {}", e);
+    if !settings_only {
+        if let Err(e) = tray::start(tray.clone()) {
+            eprintln!("警告：托盘初始化失败: {}", e);
+        }
     }
 
     let result = eframe::run_native(
         "Deskman",
         options,
-        Box::new(move |_cc| Ok(Box::new(DeskmanApp::new(config, tray)))),
+        Box::new(move |_cc| Ok(Box::new(DeskmanApp::new(config, tray, settings_only)))),
     );
 
     if let Err(e) = result {
@@ -79,6 +98,8 @@ struct DeskmanApp {
     style_initialized: bool,
     editing_group: Option<usize>,
     settings_open: bool,
+    /// true：只渲染设置界面，不接管桌面（由 `deskman settings` 启动）
+    settings_only: bool,
     new_item_name: String,
     new_item_path: String,
     new_group_name: String,
@@ -101,10 +122,12 @@ struct DeskmanApp {
 }
 
 impl DeskmanApp {
-    fn new(config: AppConfig, tray: TrayController) -> Self {
+    fn new(config: AppConfig, tray: TrayController, settings_only: bool) -> Self {
         let mut config = config;
-        // 默认锁定：编辑模式只在会话内通过 Ctrl+Alt+E 进入
-        config.locked = true;
+        // 默认锁定：编辑模式只在会话内通过 Ctrl+Alt+E 进入（设置模式除外）
+        if !settings_only {
+            config.locked = true;
+        }
         let size = [config.desktop.width, config.desktop.height];
         Self {
             config,
@@ -114,7 +137,8 @@ impl DeskmanApp {
             status_at: None,
             style_initialized: false,
             editing_group: None,
-            settings_open: false,
+            settings_open: settings_only,
+            settings_only,
             new_item_name: String::new(),
             new_item_path: String::new(),
             new_group_name: String::new(),
@@ -305,10 +329,59 @@ impl DeskmanApp {
         self.icon_textures.insert(key, loaded.clone());
         loaded
     }
+
+    /// 设置模式界面：普通窗口，只显示设置内容
+    fn settings_only_ui(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(
+                Frame::new()
+                    .fill(WINDOW_BG)
+                    .inner_margin(Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Deskman 设置")
+                            .strong()
+                            .size(17.0)
+                            .color(TEXT_PRIMARY),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if pill_button(ui, "完成", ButtonStyle::Primary).clicked() {
+                            self.request_exit = true;
+                        }
+                    });
+                });
+                ui.label(
+                    RichText::new("修改后点击下方“保存设置”，或直接关闭窗口。")
+                        .size(11.0)
+                        .color(TEXT_SECONDARY),
+                );
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        settings_window_body(ui, self);
+                    });
+            });
+
+        if self.request_exit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
 }
 
 impl eframe::App for DeskmanApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.settings_only {
+            // 设置模式是不透明普通窗口
+            return [
+                WINDOW_BG.r() as f32 / 255.0,
+                WINDOW_BG.g() as f32 / 255.0,
+                WINDOW_BG.b() as f32 / 255.0,
+                1.0,
+            ];
+        }
         // 透明窗口必须清除为全透明，否则整个窗口区域会有暗色蒙层
         [0.0, 0.0, 0.0, 0.0]
     }
@@ -318,8 +391,17 @@ impl eframe::App for DeskmanApp {
             setup_style(ctx);
             setup_chinese_fonts(ctx);
             self.style_initialized = true;
-            self.startup_desktop_flow();
+            if !self.settings_only {
+                self.startup_desktop_flow();
+            }
         }
+
+        // 设置模式：普通窗口，只渲染设置内容
+        if self.settings_only {
+            self.settings_only_ui(ctx);
+            return;
+        }
+
         click_through::enable_true_transparency();
 
         // 普通模式沉到普通层级最底部，任何窗口都能盖住它
@@ -397,7 +479,10 @@ impl eframe::App for DeskmanApp {
     }
 
     fn on_exit(&mut self) {
-        exit_restore(&mut self.state);
+        // 设置模式没有接管桌面，不能恢复桌面状态
+        if !self.settings_only {
+            exit_restore(&mut self.state);
+        }
     }
 }
 
