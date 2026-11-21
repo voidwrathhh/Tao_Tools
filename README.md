@@ -16,6 +16,7 @@ Tao_Tools/
 │   ├── deskman/
 │   ├── copilotkey/
 │   └── toolhub/
+├── plans/                 # 各工具开发计划（未完成功能、验收标准、分工边界）
 ├── AGENTS.md              # 开发规范（唯一规范文件）
 ├── README.md              # 本文件：项目总览
 └── 项目日志.md            # 项目级操作与里程碑
@@ -51,6 +52,7 @@ sertool connect COM3
 
 ## 项目日志
 
+- 各工具开发计划：[plans/](plans/README.md)（未完成功能与分工边界，动手前先读）
 - 项目级操作与里程碑：[项目日志.md](项目日志.md)
 - 各工具的逐条修改记录：`Tools/<工具名>/项目日志.md`（如 [Tools/sertool/项目日志.md](Tools/sertool/项目日志.md)）
 - 开发规范见 [AGENTS.md](AGENTS.md)；每次修改都会同步更新对应日志并推送

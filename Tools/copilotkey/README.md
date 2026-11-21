@@ -30,10 +30,6 @@ Windows 把 Copilot 键上报成 `Win + Shift + F23`。程序装一个 `WH_KEYBO
 - [x] `status` —— 查看当前配置与运行状态
 - [x] `stop` —— 停止守护进程
 - [x] `test` —— 模拟触发一次，验证端到端效果
-- [ ] 一个键映射多组动作（宏）
-- [ ] 长按 / 双击与单次按下区分
-- [ ] 图形化配置界面
-- [ ] 多套配置快速切换
 
 ## 使用方法
 
@@ -84,14 +80,12 @@ copilotkey uninstall
 - **参数解析手写 `match`**，不引入 clap（遵循根规范）
 - 配置只写 `%APPDATA%\.tao_tools\copilotkey\config.json`，不落任何密钥
 
-## 开发进度
+## 开发进度 / 开发计划
 
-- [x] v1.0.0：钩子截获 + 目标启动 + 开机自启 + trace/learn/set/target/status/test 全套命令
-- [x] v1.0.1：适配 `Tools/` 新布局（按 `[workspace]` 标记自动探测仓库根）、`target` 解析失败显式告警、守护进程热重载配置（改目标不用重启）
-- [x] 真机验证（ASUS TX Gaming FA608PM）：Copilot 键确实上报 `Win+Shift+F23`，按下后启动目标程序、搜索面板不再出现
-- [x] 本机已配置：目标为 `toolhub.exe`（工具中心），开机自启已注册，守护进程常驻
-- [ ] 待做：多动作映射、长按/双击区分、图形化配置（见上面功能列表未勾选项）
-- [ ] 待验证：不同品牌笔记本 Copilot 键上报差异（部分机型是 `F23`，部分是 `Win+Shift+F23`，用 `trace` 确认）
+- 已完成：v1.0.1 —— 钩子截获、目标启动、开机自启、配置热重载；真机验证（ASUS TX Gaming FA608PM）Copilot 键上报 `Win+Shift+F23`，本机目标为 `toolhub.exe` 且守护进程常驻
+- 下一步：长按 / 双击区分 → 一键多动作（宏）→ 多套配置切换；图形化配置界面方案未定
+- 待验证：不同品牌笔记本 Copilot 键上报差异（部分机型 `F23`，部分 `Win+Shift+F23`）
+- 计划、优先级与验收标准见 [plans/copilotkey.md](../../plans/copilotkey.md)
 
 ## 环境依赖
 

@@ -6,8 +6,31 @@
 - **workspace 清单在 `Tools/Cargo.toml` 与 `Tools/Cargo.lock`**，用 workspace 管理 `Tools/` 下所有工具成员（成员写相对路径，如 `"sertool"`）；`target/` 也在 `Tools/` 下
 - 执行 cargo 命令：`cd Tools` 之后运行，或在仓库根目录用 `cargo build --manifest-path Tools/Cargo.toml -p <工具>`
 - 仓库根目录只放文档与仓库级文件（`AGENTS.md`、`README.md`、`项目日志.md`、`.gitignore`），工具源码与 cargo 清单一律放在 `Tools/` 下
+- 每个工具的开发计划放在 `plans/<工具名>.md`（文件名与 `Tools/` 下目录名一致），索引见 `plans/README.md`
 - `AGENTS.md` 是**唯一**的开发规范文件；不要再创建 `CLAUDE.md` 等重复副本（内容重复会互相漂移）
 - 新工具接入后必须：在 `Tools/Cargo.toml` 的 members 里登记、注册到 `Tools/toolhub/registry.json`（字段说明见 `Tools/toolhub/README.md`，其中 readme 路径相对 `Tools/`）、在根 `README.md` 工具表补一行、建好 `Tools/<工具>/README.md` 与 `Tools/<工具>/项目日志.md`
+
+## 开发计划（强制）
+- 计划文件：`plans/<工具名>.md`（文件名与 `Tools/` 下目录名一致）；尚未落地的工具用拟用名，在 `plans/README.md` 索引里标「未注册」
+- **动手前先读**：修改或开发某工具前，先读它的 `plans/<工具名>.md` 与 `plans/README.md` 索引；新功能可能跨界时，再读相关工具的计划
+- **计划先行**：新增功能先在计划里登记（含验收标准）再写代码；计划里没有、且用户当次未明确要求的功能，不擅自开发
+- **计划只放未完成**：功能完成即从计划删除，写进 `<工具>/项目日志.md`，并在 README 功能列表打 `[x]`；计划文件不记录变更史
+- **README 不复制计划**：README 的「开发进度 / 开发计划」只保留摘要（≤3 行）+ 指向计划的链接
+- **防重复**：登记新功能前先 `grep` `plans/` 并查 `Tools/toolhub/registry.json`；与其它工具重叠时，在「非目标与分工边界」写明谁做、谁不做；需要跨工具抽共享代码时必须先征得用户同意（沿用「改动范围」）
+- **同步更新**：计划有变化时与代码同批提交，并更新 `plans/README.md` 索引的「状态 / 当前重点 / 最后更新」
+
+计划文件固定章节（模板）：
+
+```md
+# <工具名> 开发计划
+> 状态：规划中 | 进行中 | 暂停　最后更新：YYYY-MM-DD　版本基线：vX.Y.Z
+
+## 1. 目标
+## 2. 非目标与分工边界
+## 3. 候选功能（P0 / P1 / P2，每项一句验收标准）
+## 4. 版本规划
+## 5. 风险与未决问题
+```
 
 ## 版本规范
 每个工具独立版本号，格式 `v{major}.{minor}.{patch}`
