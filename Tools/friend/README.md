@@ -111,11 +111,11 @@ cl : Command line error D8050 : cannot execute '...\c1.dll': failed to get comma
 |---|---|---|
 | release 构建 | `cargo build -p friend --release` | 无 debuginfo，不触发 `/Z7`，最省事 |
 | 关掉 dev profile 的 debuginfo | `CARGO_PROFILE_DEV_DEBUG=0 cargo build -p friend` | dev 构建仍可用，只是无调试信息 |
-| 把临时目录指到可写位置 | `$env:TEMP=$env:TMP='<可写目录>'; cargo build -p friend` | 想保留 dev + debuginfo 时用 |
+| 把临时目录指到可写位置 | `mkdir .tmp-build; $env:TEMP=$env:TMP=(Resolve-Path .tmp-build).Path; cargo build -p friend` | 想保留 dev + debuginfo 时用；目录要**先建好**且位于仓库内（如 `Tools/.tmp-build`）才一定可写 |
 
-注意：`RUSTFLAGS='-C debuginfo=0'` **无效**。ring 的 C 编译看的是 cargo 传给构建脚本的 `DEBUG` 环境变量（profile 级），与 rustc 的 debuginfo 选项无关，`/Z7` 照样会加上，仍报 D8050。
+注意：`RUSTFLAGS='-C debuginfo=0'` **无效**。ring 的 C 编译看的是 cargo 传给构建脚本的 `DEBUG` 环境变量（profile 级），与 rustc 的 debuginfo 选项无关，`/Z7` 照样会加上，仍报 D8050（且它作用于全部 crate，不是好开关）。
 
-普通（Medium 完整性）终端一般不会遇到此问题，多见于 IDE/沙箱/受限令牌下调起的构建。
+普通（Medium 完整性）终端一般不会遇到此问题，多见于 IDE / CI / 受限令牌的沙箱子进程（例如 DSH 给子会话的沙箱策略）下调起的构建。
 
 ## 安装
 
