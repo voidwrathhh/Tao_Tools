@@ -1,4 +1,4 @@
-﻿# toolhub — Tao Tools 工具中心
+# toolhub — Tao Tools 工具中心
 
 ## 简介
 
@@ -11,7 +11,7 @@ toolhub 是 tao_tools 的统一入口：用一个列表界面集中展示所有�
 
 ## 版本
 
-v1.0.1
+v1.0.2
 
 ## 功能列表
 
@@ -110,12 +110,14 @@ workspace 根目录通过向上查找包含 `[workspace]` 的 `Cargo.toml` 得�
 | blueinfo | GUI | `blueinfo settings` | 蓝牙调试与数据可视化 |
 | sertool | TUI | `sertool settings` | 串口终端 |
 | friend | CLI | `friend --edit-config` | AI 聊天助手 |
+| copilotkey | CLI | `copilotkey status` | Copilot 键改造 |
+| toolhub | GUI | —（本工具自身） | 工具中心入口 |
 
-toolhub 自身作为入口不列入注册表，避免自引用。
+toolhub 自身也登记在注册表里，便于其它入口互相跳转；列表里会显示自己这一行，不会递归启动。
 
 ## 开发进度 / 开发计划
 
-已完成 v1.0.1：列表 UI、启动、设置直达、排序、过滤、右键菜单、注册表来源提示、命令行辅助。
+已完成 v1.0.2：列表 UI、启动、设置直达、排序、过滤、右键菜单、注册表来源提示、命令行辅助；控制台工具单独开窗并在退出后保留现场。
 
 后续计划：
 
@@ -148,7 +150,7 @@ toolhub --help
 
 界面操作：
 
-- 「启动」按钮或双击条目：运行工具
+- 「启动」按钮或双击条目：运行工具（控制台工具会在新窗口中运行，退出后窗口保留现场；GUI 工具直接开窗）
 - 「设置」按钮：直接打开该工具自带的设置界面
 - `↑` / `↓`：调整显示顺序，自动保存
 - 右键条目：打开 README / 工具目录 / 直接启动
@@ -163,5 +165,6 @@ toolhub --help
 
 ## 更新历史
 
+- v1.0.2：控制台工具（如 sertool）改用 `cmd /K` 启动，退出后窗口保留、输出可读；注册表同步 blueinfo v1.1.0（新增 `settings` 入口）与 sertool v2.4.0（`list` 启动 + `settings` 入口）
 - v1.0.1：workspace 清单迁到 `Tools/`，`workspace_root()` 同时识别 `Cargo.toml` 与 `Tools/Cargo.toml` 两种布局
 - v1.0.0：首个版本，实现列表入口、启动、设置直达、排序、过滤与注册机制

@@ -60,7 +60,7 @@
       "id": "toolhub",
       "title": "Tao Tools 工具中心",
       "description": "图形入口：启动各工具、调整顺序、直达 README",
-      "version": "1.0.1",
+      "version": "1.0.2",
       "kind": "gui",
       "launch": [],
       "settings": [],
