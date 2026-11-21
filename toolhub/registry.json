@@ -35,17 +35,6 @@
       "readme": "sertool/README.md"
     },
     {
-      "id": "copilotkey",
-      "title": "Copilot 键改造工具",
-      "description": "把 Copilot 键变成全局功能键：吞掉按键、启动自定义目标、开机自启",
-      "version": "1.0.0",
-      "kind": "cli",
-      "launch": ["status"],
-      "settings": ["status"],
-      "console": true,
-      "readme": "copilotkey/README.md"
-    },
-    {
       "id": "friend",
       "title": "AI 聊天助手",
       "description": "自定义 OpenAI 兼容 API、人格设定与终端对话",
@@ -59,13 +48,24 @@
     {
       "id": "copilotkey",
       "title": "Copilot 键改造工具",
-      "description": "把 Copilot 键变成全局自定义功能键，按下即启动指定程序",
+      "description": "把 Copilot 键变成全局功能键：吞掉按键、启动自定义目标、开机自启",
       "version": "1.0.0",
       "kind": "cli",
-      "launch": [],
-      "settings": [],
+      "launch": ["status"],
+      "settings": ["status"],
       "console": true,
       "readme": "copilotkey/README.md"
+    },
+    {
+      "id": "toolhub",
+      "title": "Tao Tools 工具中心",
+      "description": "图形入口：启动各工具、调整顺序、直达 README",
+      "version": "1.0.0",
+      "kind": "gui",
+      "launch": [],
+      "settings": [],
+      "console": false,
+      "readme": "toolhub/README.md"
     }
   ]
 }

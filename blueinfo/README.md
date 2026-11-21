@@ -1,4 +1,4 @@
-﻿# blueinfo - 通用桌面蓝牙调试工具
+# blueinfo - 通用桌面蓝牙调试工具
 
 版本: v1.0.0
 
@@ -121,3 +121,22 @@ void send_blue_packet(int fd, double timestamp, double* data, int count) {
 - [ ] 多语言界面切换
 - [ ] 历史配置导入导出（跨设备）
 - [ ] 数据回放功能
+
+## 开发规范
+
+通用规范见根目录 [AGENTS.md](../AGENTS.md)，本工具特有约定：
+
+- **模块划分**：`main.rs` 入口与 CLI → `gui.rs` 界面（eframe/egui + egui_plot 绘图）→ `comm.rs` 串口收发线程 → `data_struct.rs` 二进制协议编解码（bincode）→ `config.rs` 参数持久化
+- **线程模型**：接收线程独立读串口，通过 channel 把帧交给 GUI；GUI 渲染循环里不允许阻塞读串口
+- **协议即契约**：帧结构（帧头 + 长度 + 载荷）在 README「二进制协议」章节有 C 语言示例，改协议必须同步改文档与 `data_struct.rs`
+- **配置位置**：按 README「参数配置保存位置」落盘，不写到程序目录
+- **依赖**：`eframe/egui/egui_plot` 0.31 固定同版本号，升级要三者一起升
+
+## 开发进度
+
+- [x] v1.0.0（当前版本）：图形界面、参数配置、串口收发、数据曲线全部可用
+- [ ] 上方「开发计划」未勾选项为后续方向（BLE 接口是最大一块）
+
+## 项目日志
+
+每次修改本工具都会在同一次提交里更新 [项目日志.md](项目日志.md)。

@@ -11,3 +11,10 @@
 
 # 编辑器 / AI 工具本地设置
 .claude/settings.local.json
+
+# 本地构建日志（临时输出，不入库）
+build-*.log
+
+# 本地临时输出（如 toolhub list 重定向的文件）
+_toolhub_list.txt
+
