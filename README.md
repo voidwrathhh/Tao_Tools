@@ -2,11 +2,34 @@
 
 自定义终端工具链。安装后所有工具可直接在任意终端中调用，无需 `cargo run`。
 
+## 目录结构
+
+```
+Tao_Tools/
+├── Tools/                 # 工具源码与 cargo 工作区（一个工具一个文件夹）
+│   ├── Cargo.toml         # workspace 清单：统一管理下面所有工具成员
+│   ├── Cargo.lock
+│   ├── target/            # 构建产物（已 gitignore）
+│   ├── sertool/
+│   ├── friend/
+│   ├── blueinfo/
+│   ├── deskman/
+│   ├── copilotkey/
+│   └── toolhub/
+├── AGENTS.md              # 开发规范（唯一规范文件）
+├── README.md              # 本文件：项目总览
+└── 项目日志.md            # 项目级操作与里程碑
+```
+
+仓库根目录只放文档与仓库级文件，工具源码和 cargo 清单都在 `Tools/` 下，避免和构建产物、临时文件混在一起。
+
+> cargo 命令在 `Tools/` 里执行（如 `cd Tools && cargo build -p toolhub`）；在仓库根目录执行时加 `--manifest-path Tools/Cargo.toml`。
+
 ## 快速开始
 
 ```bash
 # 安装 sertool 到全局
-cargo install --path sertool
+cargo install --path Tools/sertool
 
 # 任意终端直接使用
 sertool list
@@ -17,17 +40,17 @@ sertool connect COM3
 
 | 工具 | 版本 | 描述 |
 |------|------|------|
-| [sertool](sertool/) | v2.3.0 | 串口终端工具（TUI 界面） |
-| [friend](friend/) | v1.0.0 | AI 聊天助手（自定义 API、人格训练） |
-| [blueinfo](blueinfo/) | v1.0.0 | 通用桌面蓝牙调试工具（GUI 图形界面） |
-| [deskman](deskman/) | v4.3.0 | 桌面接管式图标整理器（真实图标 + 原位还原） |
-| [copilotkey](copilotkey/) | v1.0.0 | Copilot 键改造工具（Windows，把 Copilot 键变成全局功能键） |
-| [toolhub](toolhub/) | v1.0.0 | 工具中心（图形入口：启动工具、调整顺序、直达 README） |
+| [sertool](Tools/sertool/) | v2.3.0 | 串口终端工具（TUI 界面） |
+| [friend](Tools/friend/) | v1.0.0 | AI 聊天助手（自定义 API、人格训练） |
+| [blueinfo](Tools/blueinfo/) | v1.0.0 | 通用桌面蓝牙调试工具（GUI 图形界面） |
+| [deskman](Tools/deskman/) | v4.3.0 | 桌面接管式图标整理器（真实图标 + 原位还原） |
+| [copilotkey](Tools/copilotkey/) | v1.0.0 | Copilot 键改造工具（Windows，把 Copilot 键变成全局功能键） |
+| [toolhub](Tools/toolhub/) | v1.0.1 | 工具中心（图形入口：启动工具、调整顺序、直达 README） |
 
 ## 项目日志
 
 - 项目级操作与里程碑：[项目日志.md](项目日志.md)
-- 各工具的逐条修改记录：`<工具名>/项目日志.md`（如 [sertool/项目日志.md](sertool/项目日志.md)）
+- 各工具的逐条修改记录：`Tools/<工具名>/项目日志.md`（如 [Tools/sertool/项目日志.md](Tools/sertool/项目日志.md)）
 - 开发规范见 [AGENTS.md](AGENTS.md)；每次修改都会同步更新对应日志并推送
 
 ## 环境要求
@@ -39,7 +62,7 @@ sertool connect COM3
 
 ```bash
 # 安装指定工具
-cargo install --path sertool
+cargo install --path Tools/sertool
 
 # 验证安装
 sertool --version

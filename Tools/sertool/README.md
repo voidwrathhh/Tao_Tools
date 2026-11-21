@@ -4,7 +4,7 @@
 sertool 是 tao_tools 工具链中的串口通信工具，提供串口扫描、连接和数据收发功能。
 
 ## 版本
-v2.3.0
+v2.4.0
 
 ## 功能
 - [x] 扫描并列出系统所有可用串口（含 USB VID/PID、设备描述）
@@ -22,6 +22,8 @@ v2.3.0
 - [x] TUI 内断开/重连串口（Ctrl+D，不退出界面）
 - [x] 回车发送/换行模式切换（Ctrl+E，Enter 发数据或换行）
 - [x] 追加 \\r\\n 开关（Ctrl+L，控制发送时是否追加换行）
+- [x] `sertool settings` 独立设置界面（默认波特率、显示/发送模式、回车发送、追加换行），配置持久化
+- [x] 配置记忆（`~/.tao_tools/sertool/config.ini`：上次端口、波特率、各开关），`connect` 未指定波特率时取配置值
 - [ ] 串口参数配置（数据位、停止位、校验位）
 - [ ] 日志保存到文件
 
@@ -52,12 +54,27 @@ cargo run -- list
 ```bash
 sertool connect <端口名> [波特率]
 
-# 默认波特率 115200
+# 不带波特率时取配置值（默认 115200）
 sertool connect COM3
 sertool connect /dev/ttyUSB0
 # 指定波特率
 sertool connect COM3 9600
 ```
+
+### 设置界面
+```bash
+sertool settings
+```
+
+TUI 设置面板，可修改默认波特率、接收/发送 HEX 模式、回车即发送、发送追加 `\r\n`：
+
+- `↑` / `↓`（或 `j` / `k`）：选择设置项
+- `←` / `→`（或 `Enter` / `Space`）：修改选中项
+- `s`：保存并退出
+- `q` / `Esc`：退出不保存
+
+配置保存在 `~/.tao_tools/sertool/config.ini`（Windows 下即 `%USERPROFILE%\.tao_tools\sertool\config.ini`）。
+每次 `connect` 成功后会自动记住本次端口与波特率，下次设置界面可见「上次端口」。
 
 ### 交互操作
 连接成功后进入 TUI 界面：
@@ -77,7 +94,7 @@ sertool connect COM3 9600
   - `Ctrl+L`：切换发送时追加 / 不追加 `\r\n`
   - `Ctrl+Enter`：强制发送（回车换行模式下使用）
   - `Esc` 或 `Ctrl+C`：退出
-- **波特率**：`connect <端口>` 不带波特率时默认为 115200（USB CDC ACM 设备波特率不影响数据传输，可在 TUI 中用 Ctrl+B 切换）
+- **波特率**：`connect <端口>` 不带波特率时取 `sertool settings` 保存的值（默认 115200）；USB CDC ACM 设备波特率不影响数据传输，连接后也可用 Ctrl+B 切换
 - **断线重连**：设备断开或拔插后自动检测，每 2 秒尝试重连
 
 ### 交互演示
@@ -96,6 +113,12 @@ sertool connect COM3 9600
 ```
 
 ## 更新历史
+
+### v2.4.0
+- 新增：`sertool settings` 独立设置界面（默认波特率、显示/发送 HEX 模式、回车即发送、追加 `\r\n`）
+- 新增：配置持久化到 `~/.tao_tools/sertool/config.ini`，连接时自动记住上次端口与波特率
+- 新增：`connect` 不指定波特率时使用配置中的默认值（仍默认 115200）
+- 新增：`src/settings.rs` 模块承载配置读写与设置 TUI，主程序保持事件循环
 
 ### v2.3.0
 - 移除：波特率自动检测（USB CDC ACM 设备上波特率设置无效，检测总是误判）
@@ -149,9 +172,9 @@ sertool connect COM3 9600
 
 ## 开发规范
 
-通用规范见根目录 [AGENTS.md](../AGENTS.md)，本工具特有约定：
+通用规范见根目录 [AGENTS.md](../../AGENTS.md)，本工具特有约定：
 
-- **单文件实现**：逻辑全部在 `src/main.rs`（约 26KB），按「参数解析 / 串口扫描 / 连接与收发 / TUI 渲染」分段组织，新增功能前先补分区注释，不要拆出无谓的小模块
+- **双文件结构**：串口与 TUI 逻辑在 `src/main.rs`，配置读写与设置 TUI 在 `src/settings.rs`；按「参数解析 / 串口扫描 / 连接与收发 / TUI 渲染 / 设置」分段组织，新增功能前先补分区注释
 - **线程模型**：接收线程独占串口读取并实时打印；主线程只负责键盘输入与串口写入 —— 遵循根规范的「交互模式约定」
 - **TUI 依赖**：`ratatui` 0.29 + `crossterm` 0.28；退出必须恢复终端（`disable_raw_mode` + `LeaveAlternateScreen`），异常退出也要走同一收尾路径
 - **串口**：波特率默认 115200，`connect` 可指定；Windows 串口名形如 `COM3`，Linux 形如 `/dev/ttyUSB0`
@@ -159,7 +182,7 @@ sertool connect COM3 9600
 
 ## 开发进度
 
-- [x] v2.3.0（当前版本）：串口扫描、连接、收发、TUI 交互全部可用
+- [x] v2.4.0（当前版本）：串口扫描、连接、收发、TUI 交互、独立设置界面与配置持久化全部可用
 - [x] v2.x 演进历史见下方「更新历史」
 - [ ] 后续需求：按根 `项目日志.md` 与本工具 `项目日志.md` 记录推进
 

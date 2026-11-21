@@ -1,4 +1,4 @@
-# deskman - 桌面快捷方式分类整理器
+﻿# deskman - 桌面快捷方式分类整理器
 
 版本: v4.3.0
 
@@ -313,7 +313,7 @@ deskman scan
 
 ## 开发规范
 
-通用规范见根目录 [AGENTS.md](../AGENTS.md)，本工具特有约定：
+通用规范见根目录 [AGENTS.md](../../AGENTS.md)，本工具特有约定：
 
 - **模块划分**：`main.rs` 启动与 CLI → `gui.rs` 主界面（最大文件）→ `desktop.rs` / `desktop_list.rs` 真实桌面图标接管 → `tray.rs` 托盘 → `window.rs` 窗口管理 → `tools.rs` 工具构建/安装 → `config.rs` 设置持久化
 - **仅 Windows**：桌面与窗口操作走 `windows-sys`，图标由 `winresource` 在 build 时嵌入；平台相关代码必须放在 `#[cfg(windows)]` 下，别污染通用逻辑

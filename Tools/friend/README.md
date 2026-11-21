@@ -1,4 +1,4 @@
-# friend - AI 聊天助手
+﻿# friend - AI 聊天助手
 
 版本: v1.0.0
 
@@ -109,7 +109,7 @@ cargo install --path friend
 
 ## 开发规范
 
-通用规范见根目录 [AGENTS.md](../AGENTS.md)，本工具特有约定：
+通用规范见根目录 [AGENTS.md](../../AGENTS.md)，本工具特有约定：
 
 - **单文件实现**：逻辑在 `src/main.rs`，按「配置加载 / 请求构造 / 回复处理 / 人格训练 / 命令分发」分段
 - **依赖克制**：HTTP 用 `ureq`（同步、不引入 tokio），JSON 用 `serde_json`，配置用 `toml`，路径用 `dirs`

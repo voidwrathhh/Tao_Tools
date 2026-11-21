@@ -143,6 +143,8 @@ fn read_registry(path: &Path) -> Result<Vec<ToolEntry>, String> {
 }
 
 fn read_registry_str(text: &str) -> Result<Vec<ToolEntry>, String> {
+    // 有些 Windows 编辑器会给 UTF-8 文件加 BOM，serde_json 不认，先去掉再解析。
+    let text = text.trim_start_matches('\u{feff}');
     let file: RegistryFile = serde_json::from_str(text).map_err(|e| e.to_string())?;
     Ok(file.tools)
 }
@@ -155,6 +157,9 @@ pub fn hub_dir() -> PathBuf {
 }
 
 /// 从当前目录或可执行文件所在目录向上寻找带 [workspace] 的 Cargo.toml
+///
+/// 当前布局把 Cargo.toml 放在 `Tools/` 下（仓库根目录只放文档），所以每层目录
+/// 既检查 `<dir>/Cargo.toml`，也检查 `<dir>/Tools/Cargo.toml`，两种布局都能定位。
 pub fn workspace_root() -> Option<PathBuf> {
     if let Some(root) = std::env::var_os("TAO_TOOLS_ROOT") {
         let root = PathBuf::from(root);
@@ -178,6 +183,10 @@ pub fn workspace_root() -> Option<PathBuf> {
         loop {
             if is_workspace_manifest(&dir.join("Cargo.toml")) {
                 return Some(dir);
+            }
+            let nested = dir.join("Tools");
+            if is_workspace_manifest(&nested.join("Cargo.toml")) {
+                return Some(nested);
             }
             if !dir.pop() {
                 break;

@@ -1,10 +1,13 @@
 # tao_tools 开发规范
 
 ## 项目结构
-- 每个工具位于根目录下的独立文件夹，文件夹名即工具名
+- 每个工具位于根目录 `Tools/` 下的独立文件夹，文件夹名即工具名（如 `Tools/sertool`）
 - 每个工具有独立的 Cargo.toml、README.md 和 项目日志.md
-- 根目录 Cargo.toml 以 workspace 管理所有工具成员
-- 新工具接入后必须：注册到 `toolhub/registry.json`（字段说明见 `toolhub/README.md`）、在根 `README.md` 工具表补一行、建好 `<工具>/README.md` 与 `<工具>/项目日志.md`
+- **workspace 清单在 `Tools/Cargo.toml` 与 `Tools/Cargo.lock`**，用 workspace 管理 `Tools/` 下所有工具成员（成员写相对路径，如 `"sertool"`）；`target/` 也在 `Tools/` 下
+- 执行 cargo 命令：`cd Tools` 之后运行，或在仓库根目录用 `cargo build --manifest-path Tools/Cargo.toml -p <工具>`
+- 仓库根目录只放文档与仓库级文件（`AGENTS.md`、`README.md`、`项目日志.md`、`.gitignore`），工具源码与 cargo 清单一律放在 `Tools/` 下
+- `AGENTS.md` 是**唯一**的开发规范文件；不要再创建 `CLAUDE.md` 等重复副本（内容重复会互相漂移）
+- 新工具接入后必须：在 `Tools/Cargo.toml` 的 members 里登记、注册到 `Tools/toolhub/registry.json`（字段说明见 `Tools/toolhub/README.md`，其中 readme 路径相对 `Tools/`）、在根 `README.md` 工具表补一行、建好 `Tools/<工具>/README.md` 与 `Tools/<工具>/项目日志.md`
 
 ## 版本规范
 每个工具独立版本号，格式 `v{major}.{minor}.{patch}`

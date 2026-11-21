@@ -1,14 +1,14 @@
-﻿{
+{
   "schema": 1,
   "tools": [
     {
       "id": "blueinfo",
       "title": "通用桌面蓝牙调试工具",
       "description": "串口蓝牙通信、实时数据曲线、参数调试面板",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "kind": "gui",
       "launch": ["bluetooth-info"],
-      "settings": [],
+      "settings": ["settings"],
       "console": false,
       "readme": "blueinfo/README.md"
     },
@@ -27,10 +27,10 @@
       "id": "sertool",
       "title": "串口终端工具",
       "description": "扫描串口、TUI 收发数据、HEX 模式与断线重连",
-      "version": "2.3.0",
+      "version": "2.4.0",
       "kind": "tui",
-      "launch": [],
-      "settings": [],
+      "launch": ["list"],
+      "settings": ["settings"],
       "console": true,
       "readme": "sertool/README.md"
     },
@@ -60,7 +60,7 @@
       "id": "toolhub",
       "title": "Tao Tools 工具中心",
       "description": "图形入口：启动各工具、调整顺序、直达 README",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "kind": "gui",
       "launch": [],
       "settings": [],

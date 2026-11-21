@@ -69,11 +69,22 @@ pub fn launch(tool: &ToolEntry, args: &[String], config: &HubConfig) -> Result<S
 
     match target {
         Target::Exe(path) => {
-            let mut command = Command::new(&path);
-            command.args(args);
-            if tool.console {
+            let mut command = if tool.console {
+                // 控制台工具用 cmd /K 包一层：工具退出后窗口保留，输出不会一闪而过
+                let mut line = quote_arg(&path.display().to_string());
+                for arg in args {
+                    line.push(' ');
+                    line.push_str(&quote_arg(arg));
+                }
+                let mut command = Command::new("cmd");
+                command.arg("/K").arg(line);
                 attach_console(&mut command);
-            }
+                command
+            } else {
+                let mut command = Command::new(&path);
+                command.args(args);
+                command
+            };
             command
                 .spawn()
                 .map_err(|e| format!("启动 {} 失败：{}", path.display(), e))?;
@@ -126,6 +137,18 @@ pub fn open_folder(path: &Path) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("打开目录 {} 失败：{}", path.display(), e))?;
     Ok(())
+}
+
+/// 给 cmd 的命令行片段加引号（路径或参数含空格时必需）
+fn quote_arg(value: &str) -> String {
+    if value.is_empty() {
+        return "\"\"".to_string();
+    }
+    if value.contains([' ', '\t', '"']) {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        value.to_string()
+    }
 }
 
 fn find_in_path(name: &str) -> Option<PathBuf> {

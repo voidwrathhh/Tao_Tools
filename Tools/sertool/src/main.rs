@@ -11,6 +11,10 @@ use ratatui::{
     DefaultTerminal,
 };
 
+mod settings;
+
+use settings::Settings;
+
 const APP_NAME: &str = "sertool";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_LINES: usize = 2000;
@@ -144,13 +148,17 @@ fn main() {
     }
     match args[1].as_str() {
         "list" => list_ports(),
+        "settings" => run_settings(),
         "connect" => {
             if args.len() < 3 {
                 eprintln!("错误：缺少端口名");
                 eprintln!("用法：{} connect <端口> [波特率]", APP_NAME);
                 std::process::exit(1);
             }
-            let baud: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(115200);
+            let baud: u32 = args
+                .get(3)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| Settings::load().baud);
             connect(&args[2], baud);
         }
         "--help" | "-h" => print_usage(),
@@ -168,7 +176,11 @@ fn print_usage() {
     println!("用法：");
     println!("  {} list                       列出可用串口", APP_NAME);
     println!(
-        "  {} connect <端口> [波特率]     连接串口（默认 115200）",
+        "  {} settings                   打开设置界面（默认波特率 / HEX / 发送选项）",
+        APP_NAME
+    );
+    println!(
+        "  {} connect <端口> [波特率]     连接串口（波特率缺省取配置，默认 115200）",
         APP_NAME
     );
     println!("  {} --version, -v               显示版本", APP_NAME);
@@ -267,15 +279,166 @@ fn parse_hex_input(s: &str) -> Result<Vec<u8>, String> {
 // ---------------------------------------------------------------------------
 
 fn connect(port_name: &str, baud_rate: u32) {
+    // 记住本次端口与波特率，下次 `sertool settings` 里能看到
+    let mut settings = Settings::load();
+    settings.last_port = port_name.to_string();
+    settings.baud = baud_rate;
+    let _ = settings.save();
+
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
     let mut terminal = ratatui::init();
-    let mut app = App::new(port_name.to_string(), baud_rate);
+    let mut app = App::new(port_name.to_string(), baud_rate, &settings);
     let res = run_tui(&mut app, &mut terminal);
     ratatui::restore();
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
 
     if let Err(e) = res {
         eprintln!("TUI 错误：{}", e);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  设置界面
+// ---------------------------------------------------------------------------
+
+const SETTING_ROWS: usize = 5;
+
+fn run_settings() {
+    let mut settings = Settings::load();
+    let mut terminal = ratatui::init();
+    let result = settings_loop(&mut settings, &mut terminal);
+    ratatui::restore();
+
+    match result {
+        Ok(msg) => println!("{}", msg),
+        Err(e) => eprintln!("TUI 错误：{}", e),
+    }
+}
+
+fn settings_loop(settings: &mut Settings, terminal: &mut DefaultTerminal) -> io::Result<String> {
+    let mut selected = 0usize;
+
+    loop {
+        terminal.draw(|frame| {
+            let chunks = Layout::vertical([
+                ratatui::layout::Constraint::Min(9),
+                ratatui::layout::Constraint::Length(4),
+            ])
+            .split(frame.area());
+
+            let rows = [
+                format!("默认波特率        : {}  （← → 切换）", settings.baud),
+                format!("接收显示模式      : {}", if settings.hex_mode { "HEX" } else { "文本" }),
+                format!("发送模式          : {}", if settings.hex_send { "HEX" } else { "文本" }),
+                format!("回车即发送        : {}", yes_no(settings.enter_sends)),
+                format!("发送追加 \\r\\n     : {}", yes_no(settings.append_crlf)),
+            ];
+
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(""));
+            for (i, text) in rows.iter().enumerate() {
+                let marker = if i == selected { " ▶ " } else { "   " };
+                let style = if i == selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{}{}", marker, text),
+                    style,
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "上次端口          : {}",
+                    if settings.last_port.is_empty() {
+                        "（无）"
+                    } else {
+                        settings.last_port.as_str()
+                    }
+                ),
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("配置文件          : {}", Settings::path().display()),
+                Style::default().fg(Color::DarkGray),
+            )));
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} v{} 设置 ", APP_NAME, VERSION));
+            frame.render_widget(Paragraph::new(Text::from(lines)).block(block), chunks[0]);
+
+            let hint = "↑↓/jk 选择    ←→/Enter 修改    s 保存并退出    q/Esc 退出不保存";
+            frame.render_widget(
+                Paragraph::new(hint)
+                    .wrap(Wrap { trim: true })
+                    .block(Block::default().borders(Borders::ALL)),
+                chunks[1],
+            );
+        })?;
+
+        if !event::poll(Duration::from_millis(120))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                return Ok("已退出设置（未保存）".to_string());
+            }
+            KeyCode::Char('s') => {
+                return match settings.save() {
+                    Ok(()) => Ok(format!("设置已保存到 {}", Settings::path().display())),
+                    Err(e) => Err(io::Error::other(format!("保存设置失败：{}", e))),
+                };
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = (selected + SETTING_ROWS - 1) % SETTING_ROWS;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1) % SETTING_ROWS;
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => {
+                let forward = key.code != KeyCode::Left;
+                match selected {
+                    0 => {
+                        let current = COMMON_BAUD_RATES
+                            .iter()
+                            .position(|&b| b == settings.baud)
+                            .unwrap_or(5);
+                        let next = if forward {
+                            (current + 1) % COMMON_BAUD_RATES.len()
+                        } else {
+                            (current + COMMON_BAUD_RATES.len() - 1) % COMMON_BAUD_RATES.len()
+                        };
+                        settings.baud = COMMON_BAUD_RATES[next];
+                    }
+                    1 => settings.hex_mode = !settings.hex_mode,
+                    2 => settings.hex_send = !settings.hex_send,
+                    3 => settings.enter_sends = !settings.enter_sends,
+                    4 => settings.append_crlf = !settings.append_crlf,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "是"
+    } else {
+        "否"
     }
 }
 
@@ -302,7 +465,7 @@ struct App {
 }
 
 impl App {
-    fn new(port_name: String, baud_rate: u32) -> Self {
+    fn new(port_name: String, baud_rate: u32, settings: &Settings) -> Self {
         let info = Self::open_port(&port_name, baud_rate);
         App {
             port_name,
@@ -315,11 +478,11 @@ impl App {
             scroll: 0,
             status: info.2,
             running: true,
-            hex_mode: false,
-            hex_send: false,
+            hex_mode: settings.hex_mode,
+            hex_send: settings.hex_send,
             manual_disconnect: false,
-            enter_sends: true,
-            append_crlf: true,
+            enter_sends: settings.enter_sends,
+            append_crlf: settings.append_crlf,
         }
     }
 

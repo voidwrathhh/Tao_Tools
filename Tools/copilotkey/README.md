@@ -1,4 +1,4 @@
-# copilotkey - Copilot 键改造工具
+﻿# copilotkey - Copilot 键改造工具
 
 ## 简介
 
@@ -75,7 +75,7 @@ copilotkey uninstall
 
 ## 开发规范
 
-通用规范见根目录 [AGENTS.md](../AGENTS.md)，本工具特有约定：
+通用规范见根目录 [AGENTS.md](../../AGENTS.md)，本工具特有约定：
 
 - **平台**：仅面向 Windows 10/11（键盘钩子、注册表、控制台 API 依赖 `windows-sys`，只在 Windows 上构建与验证）
 - **模块划分**：`main.rs` 命令分发与各子命令、`hook.rs` 低级键盘钩子与事件回调、`keys.rs` 键码/修饰键名称、`config.rs` 配置读写、`autostart.rs` 注册表开机自启、`launch.rs` 启动目标、`util.rs` 控制台与宽字符等工具函数
