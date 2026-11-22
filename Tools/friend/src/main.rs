@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -50,6 +51,9 @@ struct Message {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Conversation {
+    /// 会话唯一 id；v1.0.0 的旧文件没有该字段，读取时用文件名补齐
+    #[serde(default)]
+    id: String,
     personality: String,
     created_at: String,
     updated_at: String,
@@ -236,10 +240,39 @@ fn load_config(persona: Option<&str>) -> Config {
 
 // ======================== 对话管理 ========================
 
-fn save_conversation(conv: &Conversation) -> String {
+fn conv_filename(id: &str) -> String {
+    format!("{}.json", id)
+}
+
+/// 会话 id：创建时刻 + 进程号。同一会话内固定不变，跨会话不会撞名
+fn new_conversation_id() -> String {
+    format!("{}-{}", chrono_now(), process::id())
+}
+
+fn new_conversation(config: &Config, messages: &[Message]) -> Conversation {
+    Conversation {
+        id: new_conversation_id(),
+        personality: config.personality.name.clone(),
+        created_at: now_timestamp(),
+        updated_at: now_timestamp(),
+        messages: messages.to_vec(),
+    }
+}
+
+/// 旧格式文件没有 id：用文件名（去掉 .json）补齐，续聊时即可写回同一个文件
+fn ensure_id(conv: &mut Conversation, filename: &str) {
+    if conv.id.is_empty() {
+        conv.id = filename.trim_end_matches(".json").to_string();
+    }
+}
+
+/// 始终写会话自己的那个文件（id 固定），不再按秒级时间戳把一次聊天拆成多个文件
+fn save_conversation(conv: &mut Conversation) -> String {
+    if conv.id.is_empty() {
+        conv.id = new_conversation_id();
+    }
     let dir = conv_dir();
-    let now = chrono_now();
-    let filename = format!("{}.json", now);
+    let filename = conv_filename(&conv.id);
     let path = dir.join(&filename);
 
     let json = serde_json::to_string_pretty(conv).unwrap_or_else(|e| {
@@ -260,7 +293,17 @@ fn load_conversation(filename: &str) -> Option<Conversation> {
         return None;
     }
     let content = fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
+    let mut conv: Conversation = serde_json::from_str(&content).ok()?;
+    ensure_id(&mut conv, filename);
+    Some(conv)
+}
+
+/// 同一个 id 只保留 updated_at 最新的一条（旧版本可能把一次聊天写成多个文件）
+fn dedup_by_id(mut list: Vec<(String, Conversation)>) -> Vec<(String, Conversation)> {
+    list.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+    let mut seen = HashSet::new();
+    list.retain(|(_, conv)| seen.insert(conv.id.clone()));
+    list
 }
 
 fn list_conversations() -> Vec<(String, Conversation)> {
@@ -289,9 +332,8 @@ fn list_conversations() -> Vec<(String, Conversation)> {
         }
     }
 
-    // 按更新时间排序（最新的在前）
-    list.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
-    list
+    // 同一 id 只留最新一条，整体按更新时间倒序（最新的在前）
+    dedup_by_id(list)
 }
 
 fn get_latest_conversation() -> Option<(String, Conversation)> {
@@ -442,6 +484,30 @@ fn add_training_example(context: &str, feedback: &str) {
     println!("{} 已记录这条反馈，我会记住的！", ansi("system", "💡"));
 }
 
+/// 把人格设定与最近的训练经验拼成 system prompt：新会话与 --continue 共用
+fn build_system_prompt(config: &Config) -> String {
+    compose_system_prompt(&config.personality.system_prompt, &load_training_examples())
+}
+
+/// 最近 5 条训练经验以 [经验] 形式追加在人格设定之后
+fn compose_system_prompt(base: &str, examples: &[TrainingExample]) -> String {
+    let mut prompt = base.to_string();
+    let training_context: String = examples
+        .iter()
+        .rev()
+        .take(5)
+        .map(|e| format!("[经验] {} → 反馈: {}", e.context, e.user_feedback))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !training_context.is_empty() {
+        prompt.push_str(&format!(
+            "\n\n以下是你从之前对话中学到的经验，请谨记并改进：\n{}",
+            training_context
+        ));
+    }
+    prompt
+}
+
 // ======================== 终端样式 ========================
 
 /// 根据角色名返回 AI 发言的颜色标签
@@ -479,6 +545,15 @@ fn ansi(tag: &str, text: &str) -> String {
         "violet_dim" => format!("\x1b[38;5;141m{}\x1b[0m", text),
         _ => text.to_string(),
     }
+}
+
+/// 按字符（不是字节）截断预览文本，避免把中文/emoji 切成半个字符导致 panic
+fn preview(s: &str, n_chars: usize) -> String {
+    let mut out: String = s.chars().take(n_chars).collect();
+    if s.chars().count() > n_chars {
+        out.push_str("...");
+    }
+    out
 }
 
 fn print_banner(name: &str) {
@@ -627,7 +702,7 @@ fn send_chat(config: &Config, messages: &[Message]) -> Result<String, String> {
 
 // ======================== 聊天循环 ========================
 
-fn run_chat(config: &Config, messages: &mut Vec<Message>) {
+fn run_chat(config: &Config, messages: &mut Vec<Message>, mut conv: Conversation) {
     print_banner(&config.personality.name);
     let col = ai_color(&config.personality.name);
 
@@ -645,12 +720,8 @@ fn run_chat(config: &Config, messages: &mut Vec<Message>) {
         });
     }
 
-    let mut conv = Conversation {
-        personality: config.personality.name.clone(),
-        created_at: now_timestamp(),
-        updated_at: now_timestamp(),
-        messages: messages.clone(),
-    };
+    // conv 由调用方创建（新会话）或复用（--continue）；id 固定，自动保存始终覆盖同一个文件
+    conv.messages = messages.clone();
 
     loop {
         // 读取用户输入
@@ -702,9 +773,9 @@ fn run_chat(config: &Config, messages: &mut Vec<Message>) {
                 conv.updated_at = now_timestamp();
                 conv.messages = messages.clone();
 
-                // 自动保存
+                // 自动保存（始终写同一个文件）
                 if config.chat.auto_save {
-                    save_conversation(&conv);
+                    save_conversation(&mut conv);
                 }
             }
             Err(e) => {
@@ -742,11 +813,13 @@ fn build_context(messages: &[Message], max_context: usize) -> Vec<Message> {
 }
 
 /// 返回 true 表示退出
+///
+/// `messages` 用 `&mut Vec<Message>`：为后续 `/undo`（pop 最后一条）留出入口
 fn handle_command(
     input: &str,
     config: &Config,
     conv: &mut Conversation,
-    messages: &mut [Message],
+    messages: &mut Vec<Message>,
 ) -> bool {
     let cmd = input.split_whitespace().next().unwrap_or("");
     let rest = input[cmd.len()..].trim().to_string();
@@ -760,6 +833,8 @@ fn handle_command(
             true
         }
         "/save" => {
+            conv.messages = messages.clone();
+            conv.updated_at = now_timestamp();
             let filename = save_conversation(conv);
             println!("{} 对话已保存: {}", ansi("system", "✓"), filename);
             false
@@ -885,12 +960,7 @@ fn main() {
                     msg_count,
                 );
                 if let Some(first_user_msg) = conv.messages.iter().find(|m| m.role == "user") {
-                    let preview = if first_user_msg.content.len() > 30 {
-                        format!("{}...", &first_user_msg.content[..30])
-                    } else {
-                        first_user_msg.content.clone()
-                    };
-                    println!("     {:>6}{}", "", preview);
+                    println!("     {:>6}{}", "", preview(&first_user_msg.content, 30));
                 }
                 println!();
             }
@@ -942,19 +1012,21 @@ fn main() {
         }
         "--continue" | "-C" => {
             let config = load_config(persona_ref);
+            // 训练经验在这里也要注入，否则续聊时 /train 记录等于白记
+            let system_prompt = build_system_prompt(&config);
             match get_latest_conversation() {
                 Some((_filename, conv)) => {
-                    let mut messages = conv.messages;
+                    let mut messages = conv.messages.clone();
                     if messages.is_empty() || messages[0].role != "system" {
                         messages.insert(
                             0,
                             Message {
                                 role: "system".to_string(),
-                                content: config.personality.system_prompt.clone(),
+                                content: system_prompt,
                             },
                         );
                     } else {
-                        messages[0].content = config.personality.system_prompt.clone();
+                        messages[0].content = system_prompt;
                     }
                     println!(
                         "{} 继续上次对话（{}）\n",
@@ -974,30 +1046,27 @@ fn main() {
                         } else {
                             &config.personality.name
                         };
-                        let content = if msg.content.len() > 60 {
-                            format!("{}...", &msg.content[..60])
-                        } else {
-                            msg.content.clone()
-                        };
                         println!(
                             "{}: {}",
                             ansi(if msg.role == "user" { "user" } else { col }, tag),
-                            content
+                            preview(&msg.content, 60)
                         );
                     }
                     if messages.iter().filter(|m| m.role != "system").count() > 4 {
                         println!("{} ... 还有更多历史消息", ansi("system", ""));
                     }
                     println!();
-                    run_chat(&config, &mut messages);
+                    // 复用原会话：id 相同 → 自动保存写回同一个文件
+                    run_chat(&config, &mut messages, conv);
                 }
                 None => {
                     println!("暂无历史对话，开始新对话。");
                     let mut messages = vec![Message {
                         role: "system".to_string(),
-                        content: config.personality.system_prompt.clone(),
+                        content: system_prompt,
                     }];
-                    run_chat(&config, &mut messages);
+                    let conv = new_conversation(&config, &messages);
+                    run_chat(&config, &mut messages, conv);
                 }
             }
         }
@@ -1005,28 +1074,10 @@ fn main() {
             let config = load_config(persona_ref);
             let mut messages = vec![Message {
                 role: "system".to_string(),
-                content: config.personality.system_prompt.clone(),
+                content: build_system_prompt(&config),
             }];
-
-            let examples = load_training_examples();
-            if !examples.is_empty() {
-                let training_context: String = examples
-                    .iter()
-                    .rev()
-                    .take(5)
-                    .map(|e| format!("[经验] {} → 反馈: {}", e.context, e.user_feedback))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !training_context.is_empty() {
-                    let training_msg = format!(
-                        "\n\n以下是你从之前对话中学到的经验，请谨记并改进：\n{}",
-                        training_context
-                    );
-                    messages[0].content.push_str(&training_msg);
-                }
-            }
-
-            run_chat(&config, &mut messages);
+            let conv = new_conversation(&config, &messages);
+            run_chat(&config, &mut messages, conv);
         }
         _ => {
             eprintln!("错误: 未知参数 '{}'", cmd);
@@ -1034,5 +1085,122 @@ fn main() {
             print_usage();
             process::exit(1);
         }
+    }
+}
+
+// ======================== 单元测试 ========================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: &str, content: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    fn conv(id: &str, updated_at: &str) -> Conversation {
+        Conversation {
+            id: id.to_string(),
+            personality: "测试".to_string(),
+            created_at: "2026-11-21 09:00".to_string(),
+            updated_at: updated_at.to_string(),
+            messages: vec![msg("user", "你好")],
+        }
+    }
+
+    #[test]
+    fn preview_pure_chinese_truncates_by_chars() {
+        let s = "你好世界".repeat(10); // 40 个汉字
+        let p = preview(&s, 30);
+        assert!(p.ends_with("..."));
+        assert_eq!(p, format!("{}...", "你好世界".repeat(7) + "你好"));
+    }
+
+    #[test]
+    fn preview_pure_ascii_truncates_by_chars() {
+        let s = "a".repeat(100);
+        assert_eq!(preview(&s, 60), format!("{}...", "a".repeat(60)));
+    }
+
+    #[test]
+    fn preview_mixed_text_never_panics() {
+        // 旧实现用 &content[..30] / [..60] 按字节切，中英混排时会切在字符中间 panic
+        let s = "你好hello世界world你好hello世界world你好hello世界world";
+        for n in [0usize, 1, 3, 7, 30, 60] {
+            let p = preview(s, n);
+            assert!(p.chars().count() <= n + 3);
+        }
+        assert!(preview(s, 30).ends_with("..."));
+        assert_eq!(preview(s, 30).chars().count(), 33);
+    }
+
+    #[test]
+    fn preview_keeps_text_at_or_below_limit() {
+        assert_eq!(preview("短文本", 30), "短文本");
+        assert_eq!(preview(&"中".repeat(30), 30), "中".repeat(30));
+        assert_eq!(preview("", 30), "");
+    }
+
+    #[test]
+    fn new_conversation_id_is_filename_safe() {
+        let id = new_conversation_id();
+        assert!(!id.is_empty());
+        assert!(id
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '-' || c == '_'));
+        assert_eq!(conv_filename(&id), format!("{}.json", id));
+    }
+
+    #[test]
+    fn legacy_conversation_gets_id_from_filename() {
+        // v1.0.0 写出的文件没有 id 字段
+        let json = r#"{"personality":"朋友","created_at":"2026-11-21 09:00","updated_at":"2026-11-21 09:10","messages":[{"role":"user","content":"你好"}]}"#;
+        let mut c: Conversation = serde_json::from_str(json).unwrap();
+        assert!(c.id.is_empty(), "旧格式应解析出空 id");
+        ensure_id(&mut c, "2026-11-21_09-00-00.json");
+        assert_eq!(c.id, "2026-11-21_09-00-00");
+        assert_eq!(conv_filename(&c.id), "2026-11-21_09-00-00.json");
+    }
+
+    #[test]
+    fn dedup_by_id_keeps_newest() {
+        let list = vec![
+            ("a.json".to_string(), conv("x", "2026-11-21 09:00")),
+            ("b.json".to_string(), conv("x", "2026-11-21 10:00")),
+            ("c.json".to_string(), conv("y", "2026-11-21 08:00")),
+        ];
+        let out = dedup_by_id(list);
+        assert_eq!(out.len(), 2, "同一 id 只保留一条");
+        assert_eq!(out[0].1.id, "x");
+        assert_eq!(out[0].1.updated_at, "2026-11-21 10:00", "保留 update 最新的那条");
+        assert_eq!(out[1].1.id, "y");
+    }
+
+    #[test]
+    fn system_prompt_includes_recent_training_examples() {
+        let examples: Vec<TrainingExample> = (1..=7)
+            .map(|i| TrainingExample {
+                context: format!("上下文{}", i),
+                user_feedback: format!("反馈{}", i),
+                learned_at: format!("时间{}", i),
+            })
+            .collect();
+        let prompt = compose_system_prompt("人格设定", &examples);
+        assert!(prompt.starts_with("人格设定"));
+        assert!(prompt.contains("[经验] 上下文7 → 反馈: 反馈7"));
+        assert!(prompt.contains("[经验] 上下文3 → 反馈: 反馈3"));
+        assert!(!prompt.contains("上下文2"), "只保留最近 5 条");
+        assert!(
+            prompt.find("上下文7").unwrap() < prompt.find("上下文3").unwrap(),
+            "最新的经验排在前面"
+        );
+    }
+
+    #[test]
+    fn system_prompt_without_training_equals_base() {
+        assert_eq!(compose_system_prompt("人格", &[]), "人格");
     }
 }

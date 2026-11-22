@@ -1,6 +1,6 @@
 [package]
 name = "friend"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "AI 聊天助手 - 自定义 API、人格训练、终端对话"
 
