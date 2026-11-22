@@ -55,36 +55,39 @@ unsafe fn attach_handle(std_handle: u32, device: &str) {
 
 /// 安全地向标准输出写一段文本（控制台用宽字符，管道用 UTF-8 字节）。
 pub fn say(text: &str) {
-    if text.is_empty() {
+    unsafe { write_handle(GetStdHandle(STD_OUTPUT_HANDLE), text) }
+}
+
+/// 向标准错误写一段文本。错误信息走 stderr，但同样用宽字符输出，避免中文乱码。
+pub fn err_say(text: &str) {
+    unsafe { write_handle(GetStdHandle(STD_ERROR_HANDLE), text) }
+}
+
+unsafe fn write_handle(handle: HANDLE, text: &str) {
+    if text.is_empty() || !handle_valid(handle) {
         return;
     }
-    unsafe {
-        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
-        if !handle_valid(handle) {
-            return;
-        }
-        let mut mode: u32 = 0;
-        if GetConsoleMode(handle, &mut mode) != 0 {
-            let utf16: Vec<u16> = text.encode_utf16().collect();
-            let mut written: u32 = 0;
-            WriteConsoleW(
-                handle,
-                utf16.as_ptr(),
-                utf16.len() as u32,
-                &mut written,
-                std::ptr::null(),
-            );
-        } else {
-            let bytes = text.as_bytes();
-            let mut written: u32 = 0;
-            WriteFile(
-                handle,
-                bytes.as_ptr(),
-                bytes.len() as u32,
-                &mut written,
-                std::ptr::null_mut(),
-            );
-        }
+    let mut mode: u32 = 0;
+    if GetConsoleMode(handle, &mut mode) != 0 {
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        let mut written: u32 = 0;
+        WriteConsoleW(
+            handle,
+            utf16.as_ptr(),
+            utf16.len() as u32,
+            &mut written,
+            std::ptr::null(),
+        );
+    } else {
+        let bytes = text.as_bytes();
+        let mut written: u32 = 0;
+        WriteFile(
+            handle,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        );
     }
 }
 
@@ -115,6 +118,18 @@ pub fn timestamp() -> String {
         GetLocalTime(&mut st);
         format!(
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
+        )
+    }
+}
+
+/// 文件名安全的时间戳，形如 20261122-123001-123（用于 `.broken-<时间戳>` 备份名）。
+pub fn file_stamp() -> String {
+    unsafe {
+        let mut st: SYSTEMTIME = std::mem::zeroed();
+        GetLocalTime(&mut st);
+        format!(
+            "{:04}{:02}{:02}-{:02}{:02}{:02}-{:03}",
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
         )
     }

@@ -1,6 +1,6 @@
 # copilotkey 开发计划
 
-> 状态：进行中　最后更新：2026-11-22　版本基线：v1.0.1
+> 状态：进行中　最后更新：2026-11-22　版本基线：v1.0.2
 
 ## 1. 目标
 
@@ -13,29 +13,6 @@
 - 图形化配置界面是否做未决（见 P2），若做优先独立窗口；不因 GUI 引入常驻重依赖。
 
 ## 3. 候选功能
-
-### P0 配置原子写 + 解析失败不静默回退默认值 · 本轮执行
-
-- 证据：`src/config.rs:98-101` 用 `fs::write` 直写 `config.json`（中断即留半个文件）；`config.rs:86-93` 解析失败 `unwrap_or_else` 直接 `Config::default()`；`src/hook.rs:203-207` 每次触发都重新 `Config::load()`，撞上写入中途就拿到空 target 并报「还没有设置目标」；`src/main.rs:292-296` 的 `install` 还会把默认值写回，永久覆盖用户原文件。
-- 做法：`save()` 先写 `config.json.tmp` 再 `fs::rename` 原子替换；解析失败把原文件改名 `config.json.broken-<时间戳>` 并以非零码退出，绝不静默覆盖；`load()` 返回 `Result`，守护进程用 `OnceLock<Mutex<Config>>` 保存 last-good，只有解析成功才替换；启用一直闲置的 `version` 字段（`config.rs:9-11`）做迁移分支。
-- 验收：4KB 配置写入的同时并发 200 次触发，日志不出现「未设置目标」；手工把 `config.json` 写成 `{` 后执行 `target` / `install`，原文件被备份、命令非零码退出；`status` 显示「配置已损坏，正在使用上次有效配置」。
-- 版本：patch（v1.0.2）
-- 待决：备份保留份数、是否提供 `config --repair`。
-
-### P0 键位配置真正热重载（现在 `set` 后必须 `install` 重启）· 本轮执行
-
-- 证据：`src/hook.rs:183-188` 只在 `run()` 启动时把 `trigger_vk`/`trigger_mods`/`strict_mods`/`swallow`/`ignore_injected`/`debounce_ms` 一次性写进静态原子变量，之后不再刷新；`src/main.rs:194-196`、`main.rs:157-159` 反而提示「需要重启才能生效」，与 README「已完成配置热重载」矛盾（真正热加载的只有 target/arguments/workdir，`hook.rs:203`）。
-- 做法：抽 `hook::apply_config(&Config)` 统一刷新全部静态变量与 `util::set_logging(config.log)`；启动流程与现有 300~500ms 轮询线程（`hook.rs:200-221`）都调用它；key 变化时重算 label 并写一行「配置已热更新」；解析失败时保留旧值（依赖上一条）。
-- 验收：`copilotkey set f23` 后不重启守护进程，1 秒内按 F23 即触发、原 Win+Shift+F23 不再触发；`status` 输出的键位与守护进程内一致；`learn --save` 后立即生效。
-- 版本：patch（v1.0.2）
-
-### P0 `strict_mods` 改为真精确匹配，且修饰键状态不再变脏 · 本轮执行
-
-- 证据：`src/hook.rs:99-100` 的 `mods_ok = !STRICT_MODS || (MOD_STATE & required) == required` 只验「要求的都在」，多按一个 Ctrl 照样触发，与 README「多按/少按都不触发」不符；`hook.rs:41,79-85` 用全局 `MOD_STATE` 累积修饰键，UAC/安全桌面期间低级钩子收不到事件，状态永久残留。
-- 做法：判定瞬间用 `GetAsyncKeyState` 现算 Win/Shift/Ctrl/Alt（0x5B/0x5C、0xA0/0xA1、0xA2/0xA3、0xA4/0xA5 的 0x8000 位），删除 `MOD_STATE`；精确匹配写成 `(mods & 0xF) == (required & 0xF)`；`strict_mods=false` 保持只看主键并在 `set` 时打印提示。
-- 验收：`strict_mods=true` 时按 Win+Shift+Ctrl+F23 不触发（不吞键）；在管理员窗口前台后按键仍正常触发；`trace` 打印的修饰键与真实按键一致。
-- 版本：patch（v1.0.2）
-- 待决：现网可能习惯宽松行为，改语义要在日志与 README 明说；`GetAsyncKeyState` 在提权前台的可见性需真机实测，不稳则退回「钩子空闲 N 秒自动清零」。
 
 ### P1 `install` 不再靠固定 sleep 假装成功
 
@@ -61,7 +38,7 @@
 
 ### P2 多套配置快速切换
 
-- 验收：`copilotkey profile use <名字>` 在多份 profile 间切换；`profile list` 列出；切换不要求重启守护进程（依赖 P0 热重载）。
+- 验收：`copilotkey profile use <名字>` 在多份 profile 间切换；`profile list` 列出；切换不要求重启守护进程（依赖 v1.0.2 的键位热重载）。
 
 ### P2 图形化配置界面（未决）
 
@@ -76,7 +53,6 @@
 
 | 版本 | 内容 |
 |---|---|
-| v1.0.2 | P0 原子写 + 热重载 + 精确修饰键 |
 | v1.1.0 | P1 install 可靠性 + 运行态可观测 |
 | v1.2.0 | P2 长按/双击 + 宏 |
 | v1.3.0 | P2 多套配置；图形界面（若确认做） |
@@ -86,4 +62,5 @@
 - 长按/双击判定天然引入延迟，可能吞掉短按；需明确「延迟上限」并在文档说明。
 - 宏并发启动的顺序、工作目录、失败回滚都要先定义清楚。
 - 图形界面若引入 GUI 框架，需要评估对「无管理员权限、开机自启轻量」的影响。
-- 精确修饰键依赖 `GetAsyncKeyState` 的实时性；安全桌面/提权前台是已知盲区，需要兜底策略而不是假设永远正确。
+- 精确修饰键依赖 `GetAsyncKeyState` 的实时性；安全桌面/提权前台是已知盲区（UAC 期间低级钩子收不到事件）。v1.0.2 已改成判定瞬间现算、不再累积状态，「修饰键残留导致之后一直不触发」的问题消除；但「提权前台时能否读到修饰键」仍需真机实测，不稳则退回「钩子空闲 N 秒自动清零」。
+- v1.0.2 起配置损坏会生成 `config.json.broken-<时间戳>` 且不自动清理；保留份数与是否提供 `config --repair` / `--restore` 待决。

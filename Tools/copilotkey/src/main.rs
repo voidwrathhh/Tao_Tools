@@ -144,18 +144,20 @@ fn cmd_learn(args: &[String]) -> i32 {
             });
             out!("  标志     flags = 0x{:02X}{}\n", key.flags, if key.flags & 0x10 != 0 { "（注入事件）" } else { "" });
             if save {
-                let mut config = Config::load();
+                let mut config = config::load_or_exit();
                 config.trigger_vk = key.vk;
                 config.trigger_mods = key.mods;
                 config.trigger_label = label.clone();
+                // 学到的修饰键可能包含按 Copilot 键时顺手按住的其它键，默认放宽成只看主键。
                 config.strict_mods = false;
                 if let Err(err) = config.save() {
                     out!("\n保存失败：{}\n", err);
                     return 1;
                 }
                 out!("\n已保存，触发键 = {}\n", label);
+                out!("（已设为只看主键：多按/少按修饰键也会触发；需要精确匹配请把 config.json 的 strict_mods 设为 true）\n");
                 if hook::is_running() {
-                    out!("守护进程还在用旧配置，执行 copilotkey install 重启后生效。\n");
+                    out!("守护进程会在 1 秒内热加载新键位，无需重启。\n");
                 }
             } else {
                 out!("\n（没有保存。确认无误后加 --save 再执行一次即可写入配置。）\n");
@@ -182,7 +184,7 @@ fn cmd_set(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let mut config = Config::load();
+    let mut config = config::load_or_exit();
     config.trigger_vk = vk;
     config.trigger_mods = mods;
     config.trigger_label = keys::combo_label(vk, mods);
@@ -191,14 +193,20 @@ fn cmd_set(args: &[String]) -> i32 {
         return 1;
     }
     out!("触发键已设置为：{}\n", config.trigger_label);
+    if config.strict_mods {
+        out!("严格修饰：是（修饰键必须完全一致，多按/少按都不触发）\n");
+    } else {
+        out!("严格修饰：否 —— 只看主键，多按/少按修饰键都会触发（含 Ctrl+F23 这类误触）。\n");
+        out!("要精确匹配，把配置文件里的 strict_mods 改成 true 即可（同样无需重启守护进程）。\n");
+    }
     if hook::is_running() {
-        out!("守护进程需要重启才能生效：执行 copilotkey install。\n");
+        out!("守护进程会在 1 秒内热加载新键位，无需重启。\n");
     }
     0
 }
 
 fn cmd_target(args: &[String]) -> i32 {
-    let mut config = Config::load();
+    let mut config = config::load_or_exit();
 
     if args.is_empty() {
         if config.target.is_empty() {
@@ -272,7 +280,7 @@ fn cmd_target(args: &[String]) -> i32 {
 }
 
 fn cmd_run() -> i32 {
-    hook::run(Config::load())
+    hook::run(config::load_or_exit())
 }
 
 fn cmd_install() -> i32 {
@@ -289,10 +297,13 @@ fn cmd_install() -> i32 {
         out!("      正式使用建议：cargo build --release -p copilotkey\n\n");
     }
 
-    let config = Config::load();
-    if let Err(err) = config.save() {
-        out!("写入默认配置失败：{}\n", err);
-        return 1;
+    // 只在配置文件不存在时写入：install 绝不能把默认值覆盖到用户已有的配置上。
+    let config = config::load_or_exit();
+    if !util::config_path().exists() {
+        if let Err(err) = config.save() {
+            out!("写入初始配置失败：{}\n", err);
+            return 1;
+        }
     }
     match autostart::install(&exe_text) {
         Ok(()) => out!("已注册开机自启：HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\TaoToolsCopilotKey\n"),
@@ -350,26 +361,68 @@ fn cmd_stop() -> i32 {
     }
 }
 
-fn cmd_status() -> i32 {
-    let config = Config::load();
-    let path = util::config_path();
-    out!("copilotkey v{}\n", env!("CARGO_PKG_VERSION"));
-    out!("  配置文件：{}{}\n", path.display(), if path.exists() { "" } else { "（不存在，正在用默认值）" });
+fn print_config_fields(config: &Config) {
+    out!("  结构版本：v{}\n", config.version);
     out!("  触发键　：{}\n", config.label());
     out!(
         "  目标　　：{}\n",
-        if config.target.is_empty() { "（未设置）".to_string() } else { config.target.clone() }
+        if config.target.is_empty() {
+            "（未设置）".to_string()
+        } else {
+            config.target.clone()
+        }
     );
     if !config.arguments.is_empty() {
         out!("  参数　　：{}\n", config.arguments);
     }
-    out!("  拦截按键：{}\n", if config.swallow { "是（不会再呼出搜索面板）" } else { "否" });
-    out!("  严格修饰：{}\n", if config.strict_mods { "是" } else { "否（只看主键）" });
+    out!(
+        "  拦截按键：{}\n",
+        if config.swallow {
+            "是（不会再呼出搜索面板）"
+        } else {
+            "否"
+        }
+    );
+    out!(
+        "  严格修饰：{}\n",
+        if config.strict_mods {
+            "是（修饰键必须完全一致，多按/少按都不触发）"
+        } else {
+            "否（只看主键，多按/少按修饰键都会触发）"
+        }
+    );
+}
+
+fn cmd_status() -> i32 {
+    let path = util::config_path();
+    let running = hook::is_running();
+    out!("copilotkey v{}\n", env!("CARGO_PKG_VERSION"));
+    match Config::load() {
+        Ok(Some(config)) => {
+            out!("  配置文件：{}\n", path.display());
+            print_config_fields(&config);
+        }
+        Ok(None) => {
+            out!("  配置文件：{}（不存在，正在用默认值）\n", path.display());
+            print_config_fields(&Config::default());
+        }
+        Err(err) => {
+            // 只报告、不动文件：备份与退出交给 target / install 这类会写配置的命令。
+            out!("  配置文件：{}\n", path.display());
+            out!("  警告　　：{}\n", err);
+            if running {
+                out!("  配置已损坏，正在使用上次有效配置（守护进程内存里的 last-good）。\n");
+            } else {
+                out!("  配置已损坏，守护进程未运行，当前没有生效的配置。\n");
+            }
+            out!("  执行 copilotkey target / install 会先把原文件备份成 config.json.broken-<时间戳>，再以非零码退出。\n");
+        }
+    }
     match autostart::query() {
         Some(value) => out!("  开机自启：已启用 → {}\n", value),
         None => out!("  开机自启：未启用\n"),
     }
-    out!("  守护进程：{}\n", if hook::is_running() { "运行中" } else { "未运行" });
+    out!("  守护进程：{}\n", if running { "运行中" } else { "未运行" });
     let tail = util::tail_log(5);
     if !tail.is_empty() {
         out!("\n最近的日志：\n{}\n", tail);
@@ -378,7 +431,7 @@ fn cmd_status() -> i32 {
 }
 
 fn cmd_test() -> i32 {
-    let config = Config::load();
+    let config = config::load_or_exit();
     if config.trigger_vk == 0 {
         out!("还没有设置触发键。\n");
         return 1;

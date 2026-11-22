@@ -1,8 +1,8 @@
 //! 按键处理：名称解析、组合键格式化、修饰键状态、按键注入。
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_LCONTROL, VK_LMENU,
-    VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
 };
 
 pub const MOD_WIN: u32 = 0b0001;
@@ -10,8 +10,49 @@ pub const MOD_SHIFT: u32 = 0b0010;
 pub const MOD_CTRL: u32 = 0b0100;
 pub const MOD_ALT: u32 = 0b1000;
 
+/// 四个修饰键全部占用的位，比较时只取这 4 位。
+pub const MOD_MASK: u32 = MOD_WIN | MOD_SHIFT | MOD_CTRL | MOD_ALT;
+
 /// 微软规定 Copilot 键以 Win+Shift+F23 上报给系统，F23 = 0x86。
 pub const VK_F23: u32 = 0x86;
+
+/// 某个虚拟键此刻是否物理按下（`GetAsyncKeyState` 的 0x8000 位）。
+fn is_down_now(vk: u32) -> bool {
+    unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 }
+}
+
+/// 现算当前修饰键状态（位掩码）。
+///
+/// 判定瞬间调用，不依赖钩子累计的历史状态：UAC / 安全桌面期间低级钩子收不到键盘
+/// 事件，累计状态会永久残留，导致“多按/少按修饰键”误判。
+pub fn live_mods() -> u32 {
+    let mut mods = 0u32;
+    // 左右两侧都要看：0x5B/0x5C=Win，0xA0/0xA1=Shift，0xA2/0xA3=Ctrl，0xA4/0xA5=Alt。
+    if is_down_now(0x5B) || is_down_now(0x5C) {
+        mods |= MOD_WIN;
+    }
+    if is_down_now(0xA0) || is_down_now(0xA1) {
+        mods |= MOD_SHIFT;
+    }
+    if is_down_now(0xA2) || is_down_now(0xA3) {
+        mods |= MOD_CTRL;
+    }
+    if is_down_now(0xA4) || is_down_now(0xA5) {
+        mods |= MOD_ALT;
+    }
+    mods
+}
+
+/// 修饰键是否满足触发条件。
+///
+/// - `strict = true`：修饰键必须**完全一致**，多按一个 Ctrl 也不触发；
+/// - `strict = false`：只看主键，修饰键一概不管。
+pub fn mods_match(strict: bool, live: u32, required: u32) -> bool {
+    if !strict {
+        return true;
+    }
+    (live & MOD_MASK) == (required & MOD_MASK)
+}
 
 /// 判断是不是修饰键，返回它对应的位。
 pub fn modifier_bit(vk: u32) -> Option<u32> {
@@ -245,5 +286,43 @@ pub fn send_combo(vk: u32, mods: u32) {
             inputs.as_ptr(),
             std::mem::size_of::<INPUT>() as i32,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loose_mode_only_cares_about_main_key() {
+        // strict_mods=false：修饰键多按、少按、不按都算命中。
+        assert!(mods_match(false, 0, 0b0011));
+        assert!(mods_match(false, 0b0111, 0b0011));
+        assert!(mods_match(false, 0, 0));
+    }
+
+    #[test]
+    fn strict_mode_requires_exact_modifier_match() {
+        // 完全一致 → 触发。
+        assert!(mods_match(true, 0b0011, 0b0011));
+        assert!(mods_match(true, 0, 0));
+        // 多按一个 Ctrl → 不触发（v1.0.1 的“只验要求的都在”会误触发）。
+        assert!(!mods_match(true, 0b0111, 0b0011));
+        // 少按 Shift → 不触发。
+        assert!(!mods_match(true, 0b0001, 0b0011));
+        // Alt 之类的多余修饰键同样不触发。
+        assert!(!mods_match(true, 0b1011, 0b0011));
+    }
+
+    #[test]
+    fn strict_comparison_ignores_bits_outside_modifier_mask() {
+        assert!(mods_match(true, 0b0011 | 0x8000_0000, 0b0011));
+    }
+
+    #[test]
+    fn live_mods_never_reports_bits_outside_modifier_mask() {
+        // 不假设当前是否按着键，只验证返回值不越界（真机按 F23 的链路无法自动验证）。
+        let mods = live_mods();
+        assert_eq!(mods & !MOD_MASK, 0);
     }
 }
