@@ -275,20 +275,22 @@ impl DeskmanApp {
         }
     }
 
-    /// 启动桌面流程：先恢复上次遗留状态（崩溃/强杀保护），再扫描并接管
+    /// 启动桌面流程：先按真实显隐状态幂等对齐（崩溃/强杀保护），再扫描并接管
     fn startup_desktop_flow(&mut self) {
         eprintln!("[flow] startup: taken={} view={}", self.state.taken.len(), self.state.view_toggled);
-        if !self.state.taken.is_empty() || self.state.view_toggled {
-            restore_taken(&mut self.state);
-            self.set_status("已恢复上次的桌面图标布局");
-            eprintln!("[flow] restored");
-        }
         if self.config.desktop.takeover_icons {
+            // 接管模式直接对齐到“隐藏”：已经是隐藏态时不发命令，
+            // 崩溃/强杀残留的隐藏态也不会在启动瞬间反显一下
             let count = apply_takeover(&mut self.state, &self.config);
             eprintln!("[flow] takeover count={}", count);
             if count > 0 {
                 self.set_status(format!("已收纳 {} 个桌面图标", count));
             }
+        } else if !self.state.taken.is_empty() || self.state.view_toggled {
+            // 不接管时把上次遗留的隐藏态恢复为可见
+            restore_taken(&mut self.state);
+            self.set_status("已恢复上次的桌面图标布局");
+            eprintln!("[flow] restored");
         }
         // Dock 为空时自动收纳全部桌面快捷方式
         if self.config.dock.enabled && self.config.dock.items.is_empty() {
@@ -613,6 +615,8 @@ fn dock_inner(ui: &mut egui::Ui, app: &mut DeskmanApp) {
 
     // 逐图标目标缩放
     let mut targets = vec![1.0_f32; n];
+    // 回环模式的基础布局（中心点、透明度、深度），缩放平滑后再换算成矩形
+    let mut anchors: Vec<(f32, f32, f32, f32)> = vec![(0.0, 0.0, 1.0, 1.0); n];
     let mut places: Vec<(egui::Rect, f32, f32)> = vec![
         (Rect::from_min_size(Pos2::ZERO, Vec2::new(1.0, 1.0)), 1.0, 1.0);
         n
@@ -644,14 +648,7 @@ fn dock_inner(ui: &mut egui::Ui, app: &mut DeskmanApp) {
             }
             targets[i] = scale;
             let alpha = 0.30 + 0.70 * depth;
-            places[i] = (
-                Rect::from_center_size(
-                    Pos2::new(x, y - icon_size * scale / 2.0),
-                    Vec2::new(icon_size * scale, icon_size * scale),
-                ),
-                alpha,
-                depth,
-            );
+            anchors[i] = (x, y, alpha, depth);
         }
 
         // 底部托板
@@ -691,12 +688,48 @@ fn dock_inner(ui: &mut egui::Ui, app: &mut DeskmanApp) {
         let scroll = app.dock_scroll;
         let px = pointer.unwrap_or(Pos2::new(-9999.0, -9999.0)).x - bar_rect.left();
         let sigma = icon_size * 1.5;
-        let mut x = pad - scroll;
         for i in 0..n {
             let center_base = pad + i as f32 * (icon_size + gap) + icon_size / 2.0 - scroll;
             let d = (px - center_base).abs();
             targets[i] = 1.0 + (magnify - 1.0) * (-(d * d) / (sigma * sigma)).exp();
-            let w = icon_size * targets[i];
+        }
+    }
+
+    // 平滑插值：按帧时间归一（不同刷新率手感一致），静止时不再申请 16ms 重绘
+    let dt = ui.ctx().input(|i| i.stable_dt).clamp(0.001, 0.1);
+    // 一阶低通，时间常数 45ms：60fps 每帧约 0.30，移开鼠标后 200ms 左右收敛
+    let k = 1.0 - (-dt / 0.045).exp();
+    let mut animating = false;
+    for i in 0..n {
+        let diff = targets[i] - app.dock_scales[i];
+        if diff.abs() > 0.005 {
+            animating = true;
+        }
+        app.dock_scales[i] += diff * k;
+    }
+    if animating {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+    }
+
+    // 用平滑后的缩放重建实际矩形（此前 places 用的是未平滑的目标值，动画看不见）
+    if loop_mode {
+        for i in 0..n {
+            let (x, y, alpha, depth) = anchors[i];
+            let scale = app.dock_scales[i];
+            places[i] = (
+                Rect::from_center_size(
+                    Pos2::new(x, y - icon_size * scale / 2.0),
+                    Vec2::splat(icon_size * scale),
+                ),
+                alpha,
+                depth,
+            );
+        }
+    } else {
+        let scroll = app.dock_scroll;
+        let mut x = pad - scroll;
+        for i in 0..n {
+            let w = icon_size * app.dock_scales[i];
             places[i] = (
                 Rect::from_min_size(
                     Pos2::new(bar_rect.left() + x, bar_rect.top() + pad),
@@ -707,19 +740,6 @@ fn dock_inner(ui: &mut egui::Ui, app: &mut DeskmanApp) {
             );
             x += w + gap;
         }
-    }
-
-    // 平滑插值 + 动画检测（修复移开鼠标后的恢复卡顿）
-    let mut animating = false;
-    for i in 0..n {
-        let diff = targets[i] - app.dock_scales[i];
-        if diff.abs() > 0.005 {
-            animating = true;
-        }
-        app.dock_scales[i] += diff * 0.3;
-    }
-    if animating {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
     }
 
     // 绘制：按深度从远到近
@@ -1929,9 +1949,17 @@ fn settings_window_body(ui: &mut egui::Ui, app: &mut DeskmanApp) {
     settings_row(ui, 40.0, |ui| {
         row_texts(ui, "桌面图标显示", "切换系统桌面图标的显示/隐藏");
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-            if pill_button(ui, "切换显示", ButtonStyle::Ghost).clicked() {
-                match desktop::toggle_desktop_icons() {
-                    Ok(()) => app.set_status("已切换桌面图标显示"),
+            // 以真实目标态为准，不用本地奇偶，避免与外部改动/连续点击漂移
+            let visible = desktop_list::desktop_icons_visible()
+                .unwrap_or(!app.state.view_toggled);
+            let mut next = visible;
+            if toggle_switch(ui, &mut next).clicked() && next != visible {
+                match set_desktop_icons(&mut app.state, next) {
+                    Ok(()) => app.set_status(if next {
+                        "已显示桌面图标"
+                    } else {
+                        "已隐藏桌面图标（面板保留）"
+                    }),
                     Err(e) => app.set_status(format!("切换失败：{}", e)),
                 }
             }
@@ -2384,21 +2412,31 @@ fn fill_dock_from_desktop(app: &mut DeskmanApp) -> usize {
     added
 }
 
+/// 按目标态设置桌面图标显隐，并同步 `state.view_toggled`
+/// （true 表示图标被本工具隐藏，退出时需要恢复）。
+/// 幂等：目标态与真实状态一致时不会发送 0x7402。
+fn set_desktop_icons(state: &mut DesktopState, visible: bool) -> Result<(), String> {
+    desktop_list::set_desktop_icons_visible(visible)?;
+    let changed = state.view_toggled != !visible;
+    state.view_toggled = !visible;
+    if changed {
+        state.save();
+    }
+    Ok(())
+}
+
 /// 接管桌面：整体隐藏系统桌面图标层（退出时恢复，位置零漂移）
 fn apply_takeover(state: &mut DesktopState, _config: &AppConfig) -> usize {
-    if !state.view_toggled && desktop_list::toggle_view().is_ok() {
-        state.view_toggled = true;
-        state.save();
+    if let Err(e) = set_desktop_icons(state, false) {
+        eprintln!("[flow] 隐藏桌面图标失败：{}", e);
     }
     0
 }
 
 /// 恢复桌面图标显示（视图开关是系统原语，位置天然不丢）
 fn restore_taken(state: &mut DesktopState) {
-    if state.view_toggled {
-        let _ = desktop_list::toggle_view();
-        state.view_toggled = false;
-        state.save();
+    if let Err(e) = set_desktop_icons(state, true) {
+        eprintln!("[flow] 恢复桌面图标失败：{}", e);
     }
 }
 
@@ -2409,18 +2447,16 @@ fn exit_restore(state: &mut DesktopState) {
     }
 }
 
-/// 切换系统桌面图标显示（记录奇偶，退出时恢复）
+/// 切换系统桌面图标显示（按真实状态取反，不靠本地奇偶，避免漂移）
 fn toggle_desktop_view(app: &mut DeskmanApp) {
-    match desktop_list::toggle_view() {
-        Ok(()) => {
-            app.state.view_toggled = !app.state.view_toggled;
-            app.state.save();
-            app.set_status(if app.state.view_toggled {
-                "已隐藏桌面图标（面板保留）"
-            } else {
-                "已显示桌面图标"
-            });
-        }
+    let visible = desktop_list::desktop_icons_visible().unwrap_or(!app.state.view_toggled);
+    let next = !visible;
+    match set_desktop_icons(&mut app.state, next) {
+        Ok(()) => app.set_status(if next {
+            "已显示桌面图标"
+        } else {
+            "已隐藏桌面图标（面板保留）"
+        }),
         Err(e) => app.set_status(format!("切换失败：{}", e)),
     }
 }

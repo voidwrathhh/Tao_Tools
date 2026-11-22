@@ -27,7 +27,7 @@ mod platform {
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         FindWindowExW, FindWindowW, GetWindowLongPtrW, GetWindowThreadProcessId,
-        SendMessageW,
+        IsWindowVisible, SendMessageW,
     };
 
     const LVM_FIRST: u32 = 0x1000;
@@ -317,6 +317,60 @@ mod platform {
         Ok(())
     }
 
+    /// 桌面图标当前是否可见（目标态）。
+    ///
+    /// 优先读系统设置 `HideIcons`：它和 0x7402 改的是同一份目标态，
+    /// explorer 重启后依然有效；读不到时退回桌面列表窗口的可见性。
+    /// 两者都拿不到时返回 None（未知），调用方自行决定保守策略。
+    pub fn desktop_icons_visible() -> Option<bool> {
+        if let Some(hidden) = icons_hidden_setting() {
+            return Some(!hidden);
+        }
+        let list = desktop_listview()?;
+        Some(unsafe { IsWindowVisible(list) != 0 })
+    }
+
+    /// 注册表里的“隐藏桌面图标”开关；读取失败返回 None。
+    fn icons_hidden_setting() -> Option<bool> {
+        use windows_sys::Win32::System::Registry::{
+            RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD,
+        };
+        let subkey: Vec<u16> =
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+        let value: Vec<u16> = "HideIcons"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut data: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let ok = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                &mut data as *mut u32 as *mut _,
+                &mut size,
+            )
+        };
+        (ok == 0).then_some(data != 0)
+    }
+
+    /// 幂等地把桌面图标设为显示/隐藏：目标态与当前一致时不发 0x7402。
+    /// 返回是否真的发送了切换命令。
+    pub fn set_desktop_icons_visible(visible: bool) -> Result<bool, String> {
+        if desktop_icons_visible() == Some(visible) {
+            eprintln!("[toggle] 目标态已是 visible={}，跳过", visible);
+            return Ok(false);
+        }
+        toggle_view()?;
+        Ok(true)
+    }
+
     /// 把窗口排到普通层级的最底部（类似桌面图标层）
     pub fn send_to_bottom(hwnd: isize) {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -368,6 +422,16 @@ pub fn icon_size_px() -> Option<f32> {
 
 #[cfg(not(windows))]
 pub fn toggle_view() -> Result<(), String> {
+    Err("该功能仅支持 Windows".to_string())
+}
+
+#[cfg(not(windows))]
+pub fn desktop_icons_visible() -> Option<bool> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn set_desktop_icons_visible(_visible: bool) -> Result<bool, String> {
     Err("该功能仅支持 Windows".to_string())
 }
 

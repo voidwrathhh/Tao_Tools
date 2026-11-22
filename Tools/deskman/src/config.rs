@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -190,30 +190,30 @@ impl Default for DesktopGroup {
 impl AppConfig {
     pub fn load() -> Self {
         let path = config_path();
-        if !path.exists() {
-            let mut config = Self::default();
-            config.normalize_layouts(false);
-            return config;
-        }
-        let mut config: Self = fs::read_to_string(&path)
-            .ok()
-            .and_then(|content| serde_json::from_str(&content).ok())
-            .unwrap_or_default();
+        let mut config: Self = match read_json_file(&path) {
+            Some(config) => config,
+            None => match read_json_file(&sibling_path(&path, ".bak")) {
+                Some(config) => {
+                    eprintln!("提示：主配置不可用，已从备份恢复 {}", path.display());
+                    config
+                }
+                None => {
+                    if path.exists() {
+                        eprintln!("警告：配置文件损坏，已使用默认配置 {}", path.display());
+                    }
+                    Self::default()
+                }
+            },
+        };
         config.normalize_layouts(false);
         config
     }
 
     pub fn save(&self) {
         let path = config_path();
-        if let Some(parent) = path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!("警告：无法创建配置目录 {} - {}", parent.display(), e);
-                return;
-            }
-        }
         match serde_json::to_string_pretty(self) {
             Ok(content) => {
-                if let Err(e) = fs::write(&path, content) {
+                if let Err(e) = write_json_atomic(&path, &content) {
                     eprintln!("警告：无法保存配置 {} - {}", path.display(), e);
                 }
             }
@@ -344,26 +344,85 @@ pub struct DesktopState {
 impl DesktopState {
     pub fn load() -> Self {
         let path = desktop_state_path();
-        fs::read_to_string(&path)
-            .ok()
-            .and_then(|content| serde_json::from_str(&content).ok())
-            .unwrap_or_default()
+        let bak = sibling_path(&path, ".bak");
+        if let Some(state) = read_json_file(&path) {
+            return state;
+        }
+        if let Some(state) = read_json_file(&bak) {
+            eprintln!("提示：桌面状态主文件不可用，已从备份恢复 {}", bak.display());
+            return state;
+        }
+        if !path.exists() && !bak.exists() {
+            // 首次启动没有任何历史，不做“恢复”动作，避免把可见的图标切走
+            return Self::default();
+        }
+        // 主文件与备份都损坏：保守认为上次可能隐藏过图标，启动时先恢复显示
+        eprintln!("警告：桌面状态文件损坏，按保守值启动（先恢复桌面图标显示）");
+        Self {
+            taken: Vec::new(),
+            view_toggled: true,
+        }
     }
 
     pub fn save(&self) {
         let path = desktop_state_path();
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
         match serde_json::to_string_pretty(self) {
             Ok(content) => {
-                if let Err(e) = fs::write(&path, content) {
+                if let Err(e) = write_json_atomic(&path, &content) {
                     eprintln!("警告：无法保存桌面状态 {} - {}", path.display(), e);
                 }
             }
             Err(e) => eprintln!("警告：桌面状态序列化失败 - {}", e),
         }
     }
+}
+
+/// 同目录的伴生文件路径（`config.json` -> `config.json.bak` / `.tmp`）
+fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// 读取并解析 JSON；文件不存在或内容损坏都返回 None
+fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// 原子写 JSON：先写同目录 `.tmp` 并落盘，再用 rename 替换主文件；
+/// 替换前把上一份主文件留成 `.bak`。
+/// 中途崩溃最多留下一个残片 `.tmp`，主文件要么是旧的完整内容、要么是新的完整内容。
+fn write_json_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = sibling_path(path, ".tmp");
+    let bak = sibling_path(path, ".bak");
+
+    let write_tmp = || -> std::io::Result<()> {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    };
+    if let Err(e) = write_tmp() {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if path.exists() {
+        if let Err(e) = fs::copy(path, &bak) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 pub fn desktop_state_path() -> PathBuf {

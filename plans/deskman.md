@@ -1,6 +1,6 @@
 # deskman 开发计划
 
-> 状态：进行中　最后更新：2026-11-22　版本基线：v4.3.1
+> 状态：进行中　最后更新：2026-11-22　版本基线：v4.3.2
 
 ## 1. 目标
 
@@ -14,28 +14,6 @@
 - Dock 只做"本工具收集到的项目"的展示，不做全系统启动器；与 [toolhub](toolhub.md) 的启动器定位不合并。
 
 ## 3. 候选功能
-
-### P0 桌面图标显隐幂等化，统一三处入口 · 本轮执行
-
-- 证据：`src/gui.rs:1929-1938` 设置页调用 `desktop::toggle_desktop_icons()`（`desktop.rs:532-538` 用 WM_COMMAND 0x7402 发给 SysListView32），这条既不更新 `app.state.view_toggled` 也不走与托盘相同的路径；正确实现却在 `desktop_list.rs:308-318`，仅托盘（`gui.rs:2413-2426`）用到。README v4.0.0 已记录 Win11 必须发给 `SHELLDLL_DefView` 子窗口。
-- 做法：新增 `desktop_list::desktop_icons_visible()` 与 `set_desktop_icons_visible(bool)`（仅在目标态不同时发 0x7402，并同步 `state.view_toggled`）；托盘、设置页、`startup_desktop_flow`（`gui.rs:279-298`）、`Drop`（`gui.rs:483-493`）全部改走它；删除 `desktop.rs` 的重复实现。
-- 验收：Win11 设置页开关可用；启动前桌面图标已隐藏时启动不再反显；运行中重启 explorer.exe 后退出 deskman，桌面图标保持可见；连点两次开关不漂移。
-- 版本：patch（v4.3.2）
-- 待决：`0x7402` 后 `IsWindowVisible(SysListView32)` 是否可靠需实测，不可靠则改读 `HKCU\...\Explorer\Advanced\HideIcons`（与现有 IconSize 同法）；`state.taken` 与 `main.rs:231-285` 的 restore-positions/move-icon 已无写入方，是否删除需拍板。
-
-### P0 桌面状态与配置原子落盘 · 本轮执行
-
-- 证据：`config.rs:206-222` 与 `config.rs:353-366` 均 `fs::write` 直写目标文件；写入中被杀留半截 JSON，`config.rs:344-350` 的 load 静默 `unwrap_or_default()`，`DesktopState` 变空 → 退出/下次启动不再还原，桌面停在隐藏态。
-- 做法：写 `<name>.tmp` 并 flush，再用 `fs::rename` 原子替换；保留 `.bak`；load 依次尝试主文件/`.bak`，都失败时 `view_toggled` 取保守值（启动先显示一次）。
-- 验收：保存瞬间强杀进程 10 次，重启读到的 state 始终可解析且 `view_toggled` 为旧值或新值、绝不为空；手工写入半截文件后启动能显示桌面图标。
-- 版本：patch（v4.3.2）
-
-### P0 Dock 放大动画接上（`dock_scales` 目前是死代码）· 本轮执行
-
-- 证据：`gui.rs:634-655` 与 `gui.rs:698-708` 用未平滑的 scale 构造 `places`；`gui.rs:712-723` 只把插值写进 `app.dock_scales`；`gui.rs:738-739` 绘制仍读 `places` → 悬停放大瞬间跳变，16ms 重绘白跑。
-- 做法：平滑后按 `app.dock_scales[i]` 重建 `places` 的 rect（回环的 alpha/depth 保留）；插值系数按帧时间归一（现 0.3 与帧率绑定）；`animating` 仅在 `|diff|>0.005` 时 request_repaint。
-- 验收：鼠标横向扫过 Dock，图标尺寸连续渐变约 100-200ms、移开平滑回落；静止后 16ms 重绘计数为 0（仅保留 100ms 兜底）。
-- 版本：patch（v4.3.2）
 
 ### P1 图标纹理后台提取 + 有界缓存
 
@@ -84,7 +62,6 @@
 
 | 版本 | 内容 |
 |---|---|
-| v4.3.2 | P0 显隐幂等 + 原子落盘 + Dock 动画 |
 | v4.4.0 | P1 图标后台加载 + 目录实时同步 |
 | v4.5.0 | P1 拖拽到分类；P2 favicon |
 | 待定 | P2 窗口布局 / 自启 / 多屏 / 坐标夹取 |
@@ -95,3 +72,4 @@
 - favicon 抓取涉及网络与隐私（会访问站点），需默认关闭或明确提示。
 - 多显示器改动会碰核心布局逻辑（`gui.rs` 最大文件），必须在「退出原位还原」路径上回归验证。
 - 显隐统一后，Explorer 重启/多开是最容易被打破的场景，验收必须覆盖「隐藏态启动 → 退出」与「运行中重启 explorer」。
+- 未决（需拍板）：`state.taken` 与 `main.rs:231-285` 的 restore-positions/move-icon 已无写入方，是否删除尚未决定；当前保留，不做改动。
