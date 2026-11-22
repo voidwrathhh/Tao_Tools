@@ -10,14 +10,17 @@
 //   [4B magic "BLUE"] [4B payload_len(u32 LE)] [N B bincode payload]
 //   文本行以 \n 或 \r\n 分隔，在帧外独立解析。
 
-use crate::data_struct::{BinaryPacket, DeviceParam, MAGIC, MAX_CACHED_PACKETS, MAX_LOG_LINES};
+use crate::data_struct::{
+    BinaryPacket, DeviceParam, LogKind, LogLine, TimedPacket, MAGIC, MAX_CACHED_PACKETS,
+    MAX_LOG_LINES,
+};
 use serialport::SerialPort;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ─── 共享通信状态 ────────────────────────────────────────────
 
@@ -30,9 +33,8 @@ pub struct CommState {
     pub connected: Arc<AtomicBool>,
 
     // 共享数据缓冲区（后台线程写入，UI 线程读取）
-    pub binary_packets: Arc<Mutex<VecDeque<BinaryPacket>>>,
-    pub text_lines: Arc<Mutex<VecDeque<String>>>,
-    pub latest_values: Arc<Mutex<HashMap<String, f64>>>,
+    pub binary_packets: Arc<Mutex<VecDeque<TimedPacket>>>,
+    pub text_lines: Arc<Mutex<VecDeque<LogLine>>>,
     pub channel_names: Arc<Mutex<Vec<String>>>,
 }
 
@@ -47,16 +49,27 @@ impl CommState {
             connected: Arc::new(AtomicBool::new(false)),
             binary_packets: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_CACHED_PACKETS))),
             text_lines: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES))),
-            latest_values: Arc::new(Mutex::new(HashMap::new())),
             channel_names: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// 尝试连接串口并启动后台读取线程
+    /// 尝试连接串口并启动后台读取线程。
+    ///
+    /// 断线重连直接复用本对象调用本方法即可：缓冲区与端口参数都保留，
+    /// 失败时对象仍然可用，只是 `connected` 保持 false。
     pub fn connect(&mut self) -> Result<(), String> {
         if self.connected.load(Ordering::SeqCst) {
             let _ = self.disconnect();
             thread::sleep(Duration::from_millis(200));
+        }
+        self.open_port()
+    }
+
+    /// 打开串口并启动读取线程（保留已有缓冲，供重连后继续追加数据）
+    fn open_port(&mut self) -> Result<(), String> {
+        // 回收上一轮已结束的读取线程
+        if let Some(handle) = self.read_handle.take() {
+            let _ = handle.join();
         }
 
         let port = serialport::new(&self.port_name, self.baud_rate)
@@ -64,27 +77,38 @@ impl CommState {
             .open()
             .map_err(|e| format!("打开串口 {} 失败: {}", self.port_name, e))?;
 
-        self.connected.store(true, Ordering::SeqCst);
-        self.running.store(true, Ordering::SeqCst);
-
         let port = Arc::new(Mutex::new(Some(port)));
         self.port = port.clone();
+
+        self.connected.store(true, Ordering::SeqCst);
+        self.running.store(true, Ordering::SeqCst);
 
         // ── 启动后台读取线程 ──
         let running = self.running.clone();
         let connected = self.connected.clone();
         let packets = self.binary_packets.clone();
         let lines = self.text_lines.clone();
-        let values = self.latest_values.clone();
         let ch_names = self.channel_names.clone();
 
         let handle = thread::Builder::new()
             .name("serial-reader".into())
-            .spawn(move || read_loop(port, running, connected, packets, lines, values, ch_names))
-            .map_err(|e| format!("创建读取线程失败: {}", e))?;
+            .spawn(move || read_loop(port, running, connected, packets, lines, ch_names));
 
-        self.read_handle = Some(handle);
-        Ok(())
+        match handle {
+            Ok(handle) => {
+                self.read_handle = Some(handle);
+                Ok(())
+            }
+            Err(e) => {
+                // 线程没起来就不算连接成功，并把已打开的串口关掉
+                self.connected.store(false, Ordering::SeqCst);
+                self.running.store(false, Ordering::SeqCst);
+                if let Ok(mut guard) = self.port.lock() {
+                    drop(guard.take());
+                }
+                Err(format!("创建读取线程失败: {}", e))
+            }
+        }
     }
 
     /// 断开串口连接，停止后台线程
@@ -111,12 +135,12 @@ impl CommState {
             let data = format!("{}\r\n", text);
             port.write_all(data.as_bytes())
                 .map_err(|e| format!("发送失败: {}", e))?;
-            // 本地回显到日志
+            // 本地回显到日志（Tx 分类，不参与文本→曲线解析）
             let mut lines = self.text_lines.lock().unwrap();
             if lines.len() >= MAX_LOG_LINES {
                 lines.pop_front();
             }
-            lines.push_back(format!(">>> {}", text));
+            lines.push_back(LogLine::tx(format!(">>> {}", text)));
             Ok(())
         } else {
             Err("串口未连接".into())
@@ -135,7 +159,7 @@ impl CommState {
             if lines.len() >= MAX_LOG_LINES {
                 lines.pop_front();
             }
-            lines.push_back(format!(">>> [参数下发] {}", json));
+            lines.push_back(LogLine::tx(format!(">>> [参数下发] {}", json)));
             Ok(())
         } else {
             Err("串口未连接".into())
@@ -158,13 +182,13 @@ impl CommState {
     }
 
     /// 消耗缓存的二进制帧（UI 线程调用）
-    pub fn drain_packets(&self) -> Vec<BinaryPacket> {
+    pub fn drain_packets(&self) -> Vec<TimedPacket> {
         let mut guard = self.binary_packets.lock().unwrap();
         guard.drain(..).collect()
     }
 
     /// 消耗缓存的文本行（UI 线程调用）
-    pub fn drain_lines(&self) -> Vec<String> {
+    pub fn drain_lines(&self) -> Vec<LogLine> {
         let mut guard = self.text_lines.lock().unwrap();
         guard.drain(..).collect()
     }
@@ -190,9 +214,8 @@ fn read_loop(
     port: Arc<Mutex<Option<Box<dyn SerialPort>>>>,
     running: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
-    packets: Arc<Mutex<VecDeque<BinaryPacket>>>,
-    lines: Arc<Mutex<VecDeque<String>>>,
-    values: Arc<Mutex<HashMap<String, f64>>>,
+    packets: Arc<Mutex<VecDeque<TimedPacket>>>,
+    lines: Arc<Mutex<VecDeque<LogLine>>>,
     ch_names: Arc<Mutex<Vec<String>>>,
 ) {
     let mut buf = [0u8; 4096];
@@ -223,7 +246,7 @@ fn read_loop(
         }
 
         accum.extend_from_slice(&buf[..n]);
-        parse_accumulator(&mut accum, &packets, &lines, &values, &ch_names);
+        parse_accumulator(&mut accum, &packets, &lines, &ch_names);
     }
 
     connected.store(false, Ordering::SeqCst);
@@ -233,9 +256,8 @@ fn read_loop(
 
 fn parse_accumulator(
     accum: &mut Vec<u8>,
-    packets: &Arc<Mutex<VecDeque<BinaryPacket>>>,
-    lines: &Arc<Mutex<VecDeque<String>>>,
-    values: &Arc<Mutex<HashMap<String, f64>>>,
+    packets: &Arc<Mutex<VecDeque<TimedPacket>>>,
+    lines: &Arc<Mutex<VecDeque<LogLine>>>,
     ch_names: &Arc<Mutex<Vec<String>>>,
 ) {
     loop {
@@ -256,7 +278,7 @@ fn parse_accumulator(
 
                 // 尝试提取二进制帧（从 pos=0 开始，因为前面的文本已清除）
                 if let Some(packet) = try_extract_binary_frame(accum) {
-                    store_packet(packet, packets, values, ch_names);
+                    store_packet(packet, packets, ch_names);
                 } else {
                     // 数据不足，等待下次
                     break;
@@ -299,12 +321,13 @@ fn try_extract_binary_frame(accum: &mut Vec<u8>) -> Option<BinaryPacket> {
     }
 }
 
-/// 将字节切片作为 UTF-8 文本刷新到日志缓冲区
-fn flush_text(data: &[u8], lines: &Arc<Mutex<VecDeque<String>>>) {
+/// 将字节切片作为 UTF-8 文本刷新到日志缓冲区（Rx 分类）
+fn flush_text(data: &[u8], lines: &Arc<Mutex<VecDeque<LogLine>>>) {
     if data.is_empty() {
         return;
     }
     let s = String::from_utf8_lossy(data).to_string();
+    let at = Instant::now();
     let mut guard = lines.lock().unwrap();
     for line in s.split('\n') {
         let trimmed = line.trim_end_matches('\r').to_string();
@@ -312,25 +335,31 @@ fn flush_text(data: &[u8], lines: &Arc<Mutex<VecDeque<String>>>) {
             if guard.len() >= MAX_LOG_LINES {
                 guard.pop_front();
             }
-            guard.push_back(trimmed);
+            guard.push_back(LogLine {
+                kind: LogKind::Rx,
+                text: trimmed,
+                at,
+            });
         }
     }
 }
 
-/// 存储解析后的数据包，更新通道数值和曲线数据
+/// 存储解析后的数据包，更新通道名称，并缓存带接收时刻的帧
 fn store_packet(
     packet: BinaryPacket,
-    packets: &Arc<Mutex<VecDeque<BinaryPacket>>>,
-    values: &Arc<Mutex<HashMap<String, f64>>>,
+    packets: &Arc<Mutex<VecDeque<TimedPacket>>>,
     ch_names: &Arc<Mutex<Vec<String>>>,
 ) {
-    // 缓存原始包
+    // 缓存原始包（带上本地接收时刻，供曲线使用统一单调时间轴）
     {
         let mut guard = packets.lock().unwrap();
         if guard.len() >= MAX_CACHED_PACKETS {
             guard.pop_front();
         }
-        guard.push_back(packet.clone());
+        guard.push_back(TimedPacket {
+            packet: packet.clone(),
+            at: Instant::now(),
+        });
     }
 
     // 更新通道名称（自动发现）
@@ -341,15 +370,6 @@ fn store_packet(
             for i in cn.len()..n {
                 cn.push(format!("CH{}", i + 1));
             }
-        }
-    }
-
-    // 更新最新数值
-    {
-        let mut vals = values.lock().unwrap();
-        for (i, val) in packet.channel_data.iter().enumerate() {
-            let key = format!("CH{}", i + 1);
-            vals.insert(key, *val);
         }
     }
 }

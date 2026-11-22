@@ -25,6 +25,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::time::Instant;
 
 // ─── 常量 ───────────────────────────────────────────────────
 
@@ -53,6 +54,94 @@ pub struct BinaryPacket {
     pub timestamp: f64,
     pub channel_count: u8,
     pub channel_data: Vec<f64>,
+}
+
+/// 带本地接收时刻的二进制帧。
+///
+/// 曲线 x 轴统一使用本地单调时钟（连接成功时记录的 `Instant` 原点），
+/// 不再依赖设备端的 `timestamp` 字段，因此文本行与二进制帧在同一坐标系内。
+#[derive(Debug, Clone)]
+pub struct TimedPacket {
+    pub packet: BinaryPacket,
+    pub at: Instant,
+}
+
+// ─── 日志行与分类 ────────────────────────────────────────────
+
+/// 日志行来源分类。
+///
+/// 只有「设备发来（Rx）且不是回显/提示前缀」的行才允许参与文本→曲线解析，
+/// 避免本地回显（如 `>>> SET_L_TARGET: 500`）被当成设备数据新建通道。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogKind {
+    /// 从设备收到的原始文本行
+    Rx,
+    /// 本地发送/回显（`>>>` 前缀）
+    Tx,
+    /// 错误提示
+    Err,
+    /// 程序内部信息
+    Info,
+}
+
+impl LogKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            LogKind::Rx => "RX",
+            LogKind::Tx => "TX",
+            LogKind::Err => "ERR",
+            LogKind::Info => "信息",
+        }
+    }
+}
+
+/// 带分类与产生时刻的一行日志
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    pub kind: LogKind,
+    pub text: String,
+    /// 行产生（接收/发送）时的本地单调时钟，用于文本曲线的时间轴
+    pub at: Instant,
+}
+
+impl LogLine {
+    pub fn new(kind: LogKind, text: impl Into<String>) -> Self {
+        Self {
+            kind,
+            text: text.into(),
+            at: Instant::now(),
+        }
+    }
+
+    /// 生产代码中 Rx 行由 `flush_text` 批量构造（整块共享同一个 `at`），
+    /// 此处保留对称构造器供测试与未来单独使用。
+    #[allow(dead_code)]
+    pub fn rx(text: impl Into<String>) -> Self {
+        Self::new(LogKind::Rx, text)
+    }
+
+    pub fn tx(text: impl Into<String>) -> Self {
+        Self::new(LogKind::Tx, text)
+    }
+
+    pub fn err(text: impl Into<String>) -> Self {
+        Self::new(LogKind::Err, text)
+    }
+
+    pub fn info(text: impl Into<String>) -> Self {
+        Self::new(LogKind::Info, text)
+    }
+
+    /// 是否可以参与「文本→曲线」解析：只解析设备发来的、非回显/提示前缀的行
+    pub fn is_plottable(&self) -> bool {
+        self.kind == LogKind::Rx && !is_echo_prefix(&self.text)
+    }
+}
+
+/// `>>>` 为本地回显，`[..]` 为程序提示，均不作为设备数据解析
+pub fn is_echo_prefix(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with(">>>") || trimmed.starts_with('[')
 }
 
 // ─── 设备参数 ────────────────────────────────────────────────
@@ -168,6 +257,11 @@ impl PlotChannel {
     /// 当前采样数
     pub fn len(&self) -> usize {
         self.data.len()
+    }
+
+    /// 最近一个采样值（无数据时返回 None），用于按通道顺序展示实时数值
+    pub fn last_value(&self) -> Option<f64> {
+        self.data.back().map(|point| point[1])
     }
 }
 

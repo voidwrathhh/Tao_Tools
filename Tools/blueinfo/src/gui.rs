@@ -9,11 +9,15 @@
 use crate::comm::CommState;
 use crate::config::AppConfig;
 use crate::data_struct::{
-    default_params, DeviceParam, ParamValue, PlotChannel, CHART_COLORS, MAX_SAMPLES_PER_CHANNEL,
+    default_params, is_echo_prefix, DeviceParam, LogKind, LogLine, ParamValue, PlotChannel,
+    CHART_COLORS, MAX_LOG_LINES, MAX_SAMPLES_PER_CHANNEL,
 };
 use eframe::egui::{self, Color32, RichText, ScrollArea, Vec2};
 use egui_plot::{Legend, Line, Plot, PlotPoints};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// 断线重连周期（验收要求约 3 秒一次）
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(3);
 
 // ─── 主应用状态 ────────────────────────────────────────────
 
@@ -24,17 +28,25 @@ pub struct BlueInfoApp {
     available_ports: Vec<(String, String)>,
     selected_port: String,
     selected_baud: u32,
-    reconnect_countdown: f64,
+
+    // ── 断线重连状态机（与 comm 的生命周期解耦）──
+    /// 自本次掉线以来已尝试的重连次数
+    reconnect_attempts: u32,
+    /// 下一次允许重试的时间点；None 表示尚未安排
+    next_retry_at: Option<Instant>,
 
     params: Vec<ParamValue>,
 
     text_input: String,
-    log_lines: Vec<String>,
+    log_lines: Vec<LogLine>,
     log_auto_scroll: bool,
 
     plot_channels: Vec<PlotChannel>,
     axis_auto_scale: bool,
-    plot_time_start: f64,
+    /// 本次连接的时间原点：连接成功时统一重置，文本行与二进制帧共用
+    plot_time_start: Option<Instant>,
+    /// 已推入曲线的最大相对时间；重连时据此把原点前移，保证时间轴连续
+    plot_last_time: f64,
 
     latest_raw: Vec<(String, f64)>,
 
@@ -83,14 +95,16 @@ impl BlueInfoApp {
             available_ports: ports,
             selected_port,
             selected_baud,
-            reconnect_countdown: 0.0,
+            reconnect_attempts: 0,
+            next_retry_at: None,
             params,
             text_input: String::new(),
-            log_lines: Vec::with_capacity(1000),
+            log_lines: Vec::with_capacity(MAX_LOG_LINES),
             log_auto_scroll: true,
             plot_channels: Vec::new(),
             axis_auto_scale: true,
-            plot_time_start: 0.0,
+            plot_time_start: None,
+            plot_last_time: 0.0,
             latest_raw: Vec::new(),
             frame_times: std::collections::VecDeque::with_capacity(120),
             fps: 60.0,
@@ -130,18 +144,36 @@ impl BlueInfoApp {
         let mut comm = CommState::new(self.selected_port.clone(), self.selected_baud);
         match comm.connect() {
             Ok(()) => {
-                self.plot_time_start = 0.0;
-                self.user_disconnected = false;
-                self.plot_channels.clear();
                 self.comm = Some(comm);
+                self.on_connected(false);
+                self.log_info(format!(
+                    "[连接] 已连接 {} @ {}",
+                    self.selected_port, self.selected_baud
+                ));
             }
             Err(e) => {
-                self.log_lines.push(format!("[错误] {}", e));
-                if self.log_lines.len() > 1000 {
-                    self.log_lines.drain(0..500);
-                }
+                self.log_err(format!("[错误] {}", e));
             }
         }
+    }
+
+    /// 连接成功后的统一收尾：重置时间原点与重连状态
+    ///
+    /// `is_reconnect = true` 时保留已有曲线，把时间原点前移到「上一段最后
+    /// 一个采样点」，使重连后的数据紧接上一段，时间轴保持连续。
+    fn on_connected(&mut self, is_reconnect: bool) {
+        let now = Instant::now();
+        if is_reconnect {
+            self.plot_time_start = Some(continuation_origin(now, self.plot_last_time));
+        } else {
+            self.plot_channels.clear();
+            self.latest_raw.clear();
+            self.plot_last_time = 0.0;
+            self.plot_time_start = Some(now);
+        }
+        self.reconnect_attempts = 0;
+        self.next_retry_at = None;
+        self.user_disconnected = false;
     }
 
     fn disconnect(&mut self) {
@@ -149,6 +181,9 @@ impl BlueInfoApp {
             let _ = comm.disconnect();
         }
         self.user_disconnected = true;
+        self.reconnect_attempts = 0;
+        self.next_retry_at = None;
+        self.log_info("[连接] 已断开（不再自动重连）");
     }
 
     fn send_text(&mut self) {
@@ -158,13 +193,10 @@ impl BlueInfoApp {
         }
         if let Some(ref comm) = self.comm {
             if let Err(e) = comm.send_text(&text) {
-                self.log_lines.push(format!("[发送失败] {}", e));
-                if self.log_lines.len() > 1000 {
-                    self.log_lines.drain(0..500);
-                }
+                self.log_err(format!("[发送失败] {}", e));
             }
         } else {
-            self.log_lines.push("[错误] 串口未连接".into());
+            self.log_err("[错误] 串口未连接");
         }
         self.text_input.clear();
     }
@@ -182,18 +214,18 @@ impl BlueInfoApp {
             })
             .collect();
         if let Some(ref comm) = self.comm {
+            // 回显由 comm.send_params 记录为 Tx 行，不参与文本→曲线解析
             if let Err(e) = comm.send_params(&device_params) {
-                self.log_lines.push(format!("[参数下发失败] {}", e));
+                self.log_err(format!("[参数下发失败] {}", e));
             }
         } else {
-            self.log_lines
-                .push("[错误] 串口未连接，无法下发参数".into());
+            self.log_err("[错误] 串口未连接，无法下发参数");
         }
     }
 
     fn reset_params(&mut self) {
         self.params = default_params().into_iter().map(ParamValue::from).collect();
-        self.log_lines.push("[参数] 已恢复默认值".into());
+        self.log_info("[参数] 已恢复默认值");
     }
 
     fn save_config(&mut self) {
@@ -224,21 +256,164 @@ impl BlueInfoApp {
         }
         cfg.save();
         self.config = cfg;
-        self.log_lines
-            .push("[配置] 已保存到 ~/.tao_tools/blueinfo/config.json".into());
+        self.log_info("[配置] 已保存到 ~/.tao_tools/blueinfo/config.json");
     }
 
     fn export_log(&mut self) {
         let path = format!("blueinfo_log_{}.txt", chrono_now());
-        if let Err(e) = std::fs::write(&path, self.log_lines.join("\n")) {
-            self.log_lines.push(format!("[导出失败] {}: {}", path, e));
+        let body = self
+            .log_lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Err(e) = std::fs::write(&path, body) {
+            self.log_err(format!("[导出失败] {}: {}", path, e));
         } else {
-            self.log_lines.push(format!("[导出] 日志已保存到 {}", path));
+            self.log_info(format!("[导出] 日志已保存到 {}", path));
         }
     }
 
     fn clear_log(&mut self) {
         self.log_lines.clear();
+    }
+
+    // ── 日志与时间轴辅助 ──────────────────────────────────
+
+    fn push_log(&mut self, line: LogLine) {
+        if self.log_lines.len() >= MAX_LOG_LINES {
+            self.log_lines.drain(0..MAX_LOG_LINES / 2);
+        }
+        self.log_lines.push(line);
+    }
+
+    fn log_info(&mut self, text: impl Into<String>) {
+        self.push_log(LogLine::info(text));
+    }
+
+    fn log_err(&mut self, text: impl Into<String>) {
+        self.push_log(LogLine::err(text));
+    }
+
+    /// 计算相对时间（秒）。文本行与二进制帧共用同一 Instant 原点。
+    fn rel_time(&mut self, at: Instant) -> f64 {
+        let origin = match self.plot_time_start {
+            Some(o) => o,
+            None => {
+                self.plot_time_start = Some(at);
+                at
+            }
+        };
+        rel_secs(origin, at)
+    }
+
+    fn note_sample_time(&mut self, t: f64) {
+        if t > self.plot_last_time {
+            self.plot_last_time = t;
+        }
+        self.latest_raw = self
+            .plot_channels
+            .iter()
+            .map(|c| (c.name.clone(), c.last_value().unwrap_or(0.0)))
+            .collect();
+    }
+
+    fn push_text_sample(&mut self, key: &str, val: f64, t: f64) {
+        let idx = match self.plot_channels.iter().position(|c| c.name == key) {
+            Some(i) => i,
+            None => {
+                let color = CHART_COLORS[self.plot_channels.len() % CHART_COLORS.len()];
+                self.plot_channels.push(PlotChannel::new(key, color));
+                self.plot_channels.len() - 1
+            }
+        };
+        self.plot_channels[idx].push(t, val);
+        self.packet_count += 1;
+        self.note_sample_time(t);
+    }
+
+    /// 拉取串口缓冲：日志分类入列；只有 Rx 且非回显前缀的文本行参与文本→曲线
+    fn poll_serial(&mut self) {
+        let Some(comm) = self.comm.take() else {
+            return;
+        };
+        let lines = comm.drain_lines();
+        let packets = comm.drain_packets();
+        self.comm = Some(comm);
+
+        for line in lines {
+            if self.text_parse_enabled && line.is_plottable() && !is_echo_prefix(&line.text) {
+                if let Some((key, val)) = parse_text_value(&line.text) {
+                    let t = self.rel_time(line.at);
+                    self.push_text_sample(key, val, t);
+                }
+            }
+            self.push_log(line);
+        }
+
+        for tp in packets {
+            self.packet_count += 1;
+            let t = self.rel_time(tp.at);
+            while self.plot_channels.len() < tp.packet.channel_count as usize {
+                let idx = self.plot_channels.len();
+                let color = CHART_COLORS[idx % CHART_COLORS.len()];
+                let name = format!("CH{}", idx + 1);
+                self.plot_channels.push(PlotChannel::new(&name, color));
+            }
+            for (i, val) in tp.packet.channel_data.iter().enumerate() {
+                if i < self.plot_channels.len() {
+                    self.plot_channels[i].push(t, *val);
+                }
+            }
+            self.note_sample_time(t);
+        }
+    }
+
+    /// 掉线检测 + 固定周期重试的状态机
+    ///
+    /// 重连复用同一个 `CommState`（缓冲与端口信息都保留），失败只记日志，
+    /// 不把 `self.comm` 置空；用户点「断开」后 `user_disconnected` 阻止重试。
+    fn maybe_reconnect(&mut self) {
+        if !self.auto_reconnect || self.user_disconnected {
+            return;
+        }
+        if self.comm.as_ref().map(|c| c.is_connected()).unwrap_or(true) {
+            return;
+        }
+
+        let now = Instant::now();
+        match self.next_retry_at {
+            None => {
+                self.log_err("[连接] 串口已断开，进入自动重连");
+                self.reconnect_attempts = 0;
+                self.next_retry_at = Some(now);
+            }
+            Some(due) if now >= due => {}
+            Some(_) => return,
+        }
+
+        // 到达重试时间点，执行一次连接尝试
+        self.reconnect_attempts += 1;
+        self.next_retry_at = Some(now + RECONNECT_INTERVAL);
+        let Some(mut comm) = self.comm.take() else {
+            self.next_retry_at = None;
+            return;
+        };
+        let attempt = self.reconnect_attempts;
+        let port = comm.port_name.clone();
+        let baud = comm.baud_rate;
+        self.log_info(format!("[重连] 第 {} 次尝试：{} @ {} ..", attempt, port, baud));
+        match comm.connect() {
+            Ok(()) => {
+                self.comm = Some(comm);
+                self.on_connected(true);
+                self.log_info("[重连] 成功，曲线继续追加");
+            }
+            Err(e) => {
+                self.comm = Some(comm);
+                self.log_err(format!("[重连] 第 {} 次失败：{}", attempt, e));
+            }
+        }
     }
 }
 
@@ -256,7 +431,7 @@ fn chrono_now() -> String {
     format!("{:04}{:02}{:02}_{:02}{:02}{:02}", y, 1, 1, h, m, s)
 }
 
-// ??? ??????????
+// ─── 串口显示标签 ──────────────────────────────────────────
 
 fn current_port_label(app: &BlueInfoApp) -> String {
     app.available_ports
@@ -272,18 +447,19 @@ fn current_port_label(app: &BlueInfoApp) -> String {
         })
 }
 
-// ??? ??????? ??????????????????????????????????????
+// ─── 文本行 → 通道数值 ─────────────────────────────────────
 //
-// ? MCU ????????? "KEY: value" ? "KEY = value"
-// ?????????/?????????????
+// 只有 Rx 且非回显前缀（">>> " / "[..]"）的行才会进入本函数，见 poll_serial。
+// 支持的格式："KEY: value" 与 "KEY = value"，键名不含空白、长度 < 20。
 
 fn parse_text_value(line: &str) -> Option<(&str, f64)> {
+    let valid_key = |key: &str| !key.is_empty() && key.len() < 20 && !key.contains(char::is_whitespace);
     if let Some(idx) = line.find(':') {
         let key = line[..idx].trim();
         let val_str = line[idx + 1..].trim();
         let val_str = val_str.split_whitespace().next().unwrap_or(val_str);
         if let Ok(val) = val_str.parse::<f64>() {
-            if !key.is_empty() && key.len() < 20 {
+            if valid_key(key) {
                 return Some((key, val));
             }
         }
@@ -293,12 +469,23 @@ fn parse_text_value(line: &str) -> Option<(&str, f64)> {
         let val_str = line[idx + 1..].trim();
         let val_str = val_str.split_whitespace().next().unwrap_or(val_str);
         if let Ok(val) = val_str.parse::<f64>() {
-            if !key.is_empty() && key.len() < 20 {
+            if valid_key(key) {
                 return Some((key, val));
             }
         }
     }
     None
+}
+
+/// 相对时间：`at` 距 `origin` 的秒数（单调非负）
+fn rel_secs(origin: Instant, at: Instant) -> f64 {
+    at.saturating_duration_since(origin).as_secs_f64()
+}
+
+/// 重连后的新原点：让 `now` 时刻的采样恰好接在上一段最后采样 `last_secs` 之后，
+/// 从而在不清空曲线的前提下保持时间轴连续。
+fn continuation_origin(now: Instant, last_secs: f64) -> Instant {
+    now - Duration::from_secs_f64(last_secs.max(0.0))
 }
 
 // ─── eframe App trait ──────────────────────────────────────
@@ -317,95 +504,9 @@ impl eframe::App for BlueInfoApp {
             return;
         }
 
-        // ── 自动重连 ──
-        if self.auto_reconnect
-            && !self.user_disconnected
-            && self.comm.is_some()
-            && !self.comm.as_ref().unwrap().is_connected()
-        {
-            self.reconnect_countdown += ctx.input(|i| i.unstable_dt) as f64;
-            if self.reconnect_countdown >= 3.0 {
-                self.reconnect_countdown = 0.0;
-                self.log_lines.push("[重连] 尝试重新连接...".into());
-                let mut new_comm = CommState::new(self.selected_port.clone(), self.selected_baud);
-                match new_comm.connect() {
-                    Ok(()) => {
-                        self.comm = Some(new_comm);
-                        self.log_lines.push("[重连] 连接成功".into());
-                    }
-                    Err(e) => {
-                        self.log_lines.push(format!("[重连失败] {}", e));
-                        self.comm = None;
-                    }
-                }
-                if self.log_lines.len() > 1000 {
-                    self.log_lines.drain(0..500);
-                }
-            }
-        }
-
-        // ── 从后台线程拉取数据 ──
-        if let Some(ref comm) = self.comm {
-            if comm.is_connected() {
-                let new_lines = comm.drain_lines();
-                for line in &new_lines {
-                    if self.log_lines.len() >= 1000 {
-                        self.log_lines.drain(0..100);
-                    }
-                    self.log_lines.push(line.clone());
-
-                    // ????????? -> ????
-                    if self.text_parse_enabled {
-                        if let Some((key, val)) = parse_text_value(line) {
-                            let rel_time = if self.plot_channels.is_empty() {
-                                self.plot_time_start as f64
-                            } else {
-                                self.plot_channels[0].len() as f64 * 0.01
-                            };
-
-                            // ????/????
-                            let ch_idx = self.plot_channels.iter().position(|c| c.name == key);
-                            let idx = match ch_idx {
-                                Some(i) => i,
-                                None => {
-                                    let color =
-                                        CHART_COLORS[self.plot_channels.len() % CHART_COLORS.len()];
-                                    self.plot_channels.push(PlotChannel::new(key, color));
-                                    self.plot_channels.len() - 1
-                                }
-                            };
-                            self.plot_channels[idx].push(rel_time, val);
-                            self.packet_count += 1;
-                        }
-                    }
-                }
-
-                let packets = comm.drain_packets();
-                for pkt in &packets {
-                    self.packet_count += 1;
-                    if self.plot_time_start == 0.0 {
-                        self.plot_time_start = pkt.timestamp;
-                    }
-                    let rel_time = pkt.timestamp - self.plot_time_start;
-
-                    while self.plot_channels.len() < pkt.channel_count as usize {
-                        let idx = self.plot_channels.len();
-                        let color = CHART_COLORS[idx % CHART_COLORS.len()];
-                        let name = format!("CH{}", idx + 1);
-                        self.plot_channels.push(PlotChannel::new(&name, color));
-                    }
-
-                    for (i, val) in pkt.channel_data.iter().enumerate() {
-                        if i < self.plot_channels.len() {
-                            self.plot_channels[i].push(rel_time, *val);
-                        }
-                    }
-                }
-
-                let vals = comm.latest_values.lock().unwrap();
-                self.latest_raw = vals.iter().map(|(k, v)| (k.clone(), *v)).collect();
-            }
-        }
+        // ── 断线重连状态机 + 拉取后台数据 ──
+        self.maybe_reconnect();
+        self.poll_serial();
 
         // ── FPS ──
         let now = Instant::now();
@@ -624,10 +725,10 @@ fn left_panel(ui: &mut egui::Ui, app: &mut BlueInfoApp) {
                 }
             });
             ui.add_space(6.0);
-            let (range, prefix) = if app.selected_tab == "左电机" {
-                (0..5, "L")
+            let range = if app.selected_tab == "左电机" {
+                0..5
             } else {
-                (5..10, "R")
+                5..10
             };
             for i in range {
                 if i >= app.params.len() {
@@ -671,11 +772,10 @@ fn left_panel(ui: &mut egui::Ui, app: &mut BlueInfoApp) {
                             ];
                             for cmd in &cmds {
                                 let _ = comm.send_text(cmd);
-                                app.log_lines.push(format!(">>> [{}] {}", prefix, cmd));
                             }
                         }
                     } else {
-                        app.log_lines.push("[错误] 蓝牙未连接，无法下发参数".into());
+                        app.log_err("[错误] 蓝牙未连接，无法下发参数");
                     }
                 }
                 if ui.button("恢复默认").clicked() {
@@ -724,10 +824,16 @@ fn left_panel(ui: &mut egui::Ui, app: &mut BlueInfoApp) {
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
                             for line in app.log_lines.iter().rev().take(200).rev() {
+                                let color = match line.kind {
+                                    LogKind::Rx => Color32::from_rgb(180, 190, 200),
+                                    LogKind::Tx => Color32::from_rgb(120, 200, 255),
+                                    LogKind::Err => Color32::from_rgb(255, 130, 130),
+                                    LogKind::Info => Color32::from_rgb(150, 220, 160),
+                                };
                                 ui.label(
-                                    RichText::new(line)
+                                    RichText::new(format!("[{}] {}", line.kind.label(), line.text))
                                         .size(12.0)
-                                        .color(Color32::from_rgb(180, 190, 200)),
+                                        .color(color),
                                 );
                             }
                         });
@@ -818,6 +924,21 @@ fn status_bar(ui: &mut egui::Ui, app: &mut BlueInfoApp) {
             (Color32::RED, "● 未连接".into())
         };
         ui.colored_label(status_color, status_text);
+        if !is_connected && app.comm.is_some() && !app.user_disconnected && app.auto_reconnect {
+            let hint = match app.next_retry_at {
+                Some(due) => {
+                    let remain = due
+                        .saturating_duration_since(Instant::now())
+                        .as_secs_f64();
+                    format!(
+                        "重连中：第 {} 次失败，{:.1}s 后重试",
+                        app.reconnect_attempts, remain
+                    )
+                }
+                None => "等待重连".to_string(),
+            };
+            ui.colored_label(Color32::from_rgb(255, 190, 90), hint);
+        }
         ui.separator();
         ui.label(format!("采样: {}", app.packet_count));
         ui.separator();
@@ -862,7 +983,7 @@ fn setup_chinese_fonts(ctx: &egui::Context) {
             break;
         }
     }
-    // ?? Segoe UI Emoji ??? emoji ??
+    // 补充 Segoe UI Emoji，覆盖界面里的 emoji 字符
     let emoji_path = "C:/Windows/Fonts/seguiemj.ttf";
     if let Ok(data) = std::fs::read(emoji_path) {
         fonts
@@ -889,4 +1010,90 @@ fn parse_color(hex: &str) -> Color32 {
         }
     }
     Color32::LIGHT_BLUE
+}
+
+// ─── 单元测试（纯逻辑部分，不依赖串口设备）──────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn echo_and_log_lines_never_become_channels() {
+        // 回显前缀识别
+        assert!(is_echo_prefix(">>> SET_L_TARGET: 500"));
+        assert!(is_echo_prefix("   [参数下发] @PARAM:[]"));
+        assert!(!is_echo_prefix("CH1: 1"));
+
+        // 只有 Rx 才可参与文本→曲线
+        assert!(LogLine::rx("CH1: 1").is_plottable());
+        assert!(!LogLine::tx(">>> CH1: 1").is_plottable());
+        assert!(!LogLine::err("CH1: 1").is_plottable());
+        assert!(!LogLine::info("[连接] 已连接").is_plottable());
+
+        // 回显内容即使形如 KEY: value 也不会被解析成新通道
+        assert!(parse_text_value(">>> SET_L_TARGET: 500").is_none());
+        assert!(parse_text_value("[参数下发] CH1: 500").is_none());
+        assert_eq!(parse_text_value("CH1: 1"), Some(("CH1", 1.0)));
+        assert_eq!(parse_text_value("RPM = -3.5"), Some(("RPM", -3.5)));
+    }
+
+    #[test]
+    fn ten_hz_text_stream_spans_one_second() {
+        // 10 个采样、间隔 100ms：首尾跨度 0.9s（验收容差 ±0.1s，即 ≈1.0s±0.1s）
+        let origin = Instant::now();
+        let times: Vec<f64> = (0..10)
+            .map(|i| rel_secs(origin, origin + Duration::from_millis(100 * i)))
+            .collect();
+        assert!(times.windows(2).all(|w| w[1] >= w[0]), "时间轴必须单调");
+        let span = times[9] - times[0];
+        assert!((span - 0.9).abs() <= 0.1, "跨度异常: {span}");
+    }
+
+    #[test]
+    fn reconnect_keeps_timeline_continuous() {
+        let now = Instant::now();
+        // 上一段最后一个采样在相对时间 5.0s
+        let origin = continuation_origin(now, 5.0);
+        assert!((rel_secs(origin, now) - 5.0).abs() < 1e-9);
+        // 重连后 100ms 的采样紧接上一段，不跳变、不重置
+        assert!((rel_secs(origin, now + Duration::from_millis(100)) - 5.1).abs() < 1e-9);
+        // last_secs 为负时不应产生未来原点
+        let origin_zero = continuation_origin(now, -1.0);
+        assert!((rel_secs(origin_zero, now) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reconnect_state_machine_retries_and_stops_on_disconnect() {
+        let mut app = BlueInfoApp::new(false);
+        app.auto_reconnect = true;
+        app.user_disconnected = false;
+        // 故意使用不存在的端口：connect() 必然失败，用于验证失败路径
+        app.comm = Some(CommState::new(
+            "__blueinfo_test_missing_port__".into(),
+            115200,
+        ));
+
+        // 首次检测到掉线：立即第 1 次尝试，失败后保留 comm 并安排下一次
+        app.maybe_reconnect();
+        assert_eq!(app.reconnect_attempts, 1);
+        assert!(app.comm.is_some(), "重连失败不能丢弃端口信息");
+        assert!(app.next_retry_at.is_some());
+
+        // 未到重试时间点：不重复尝试
+        app.maybe_reconnect();
+        assert_eq!(app.reconnect_attempts, 1);
+
+        // 到点后继续按周期重试
+        app.next_retry_at = Some(Instant::now() - Duration::from_millis(1));
+        app.maybe_reconnect();
+        assert_eq!(app.reconnect_attempts, 2);
+        assert!(app.comm.is_some());
+
+        // 用户手动「断开」后不再自动重试
+        app.user_disconnected = true;
+        app.next_retry_at = Some(Instant::now() - Duration::from_millis(1));
+        app.maybe_reconnect();
+        assert_eq!(app.reconnect_attempts, 2);
+    }
 }
