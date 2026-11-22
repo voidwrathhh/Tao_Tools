@@ -1,6 +1,6 @@
 [package]
 name = "toolhub"
-version = "1.0.2"
+version = "1.1.0"
 edition = "2021"
 description = "Tao Tools 工具中心 - 工具快捷入口、排序与设置直达"
 

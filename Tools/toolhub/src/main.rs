@@ -1,4 +1,4 @@
-﻿// ======================== 命令行入口 ========================
+// ======================== 命令行入口 ========================
 //
 // toolhub 是 tao_tools 工具中心的图形入口：
 //   toolhub              打开工具中心界面
@@ -25,6 +25,7 @@ fn main() {
         Some("list") => list_tools(),
         Some("registry") => {
             let registry = registry::Registry::load();
+            warn_problems(&registry);
             match registry.source.file_path() {
                 Some(path) => println!("{}", path.display()),
                 None => println!("{}", registry.source.label()),
@@ -59,6 +60,7 @@ fn list_tools() {
     let registry = registry::Registry::load();
     let config = config::HubConfig::load();
     let tools = config.apply_order(&registry.tools);
+    warn_problems(&registry);
 
     if tools.is_empty() {
         println!("注册表为空：{}", registry.source.label());
@@ -75,6 +77,19 @@ fn list_tools() {
             tool.kind,
             launcher::describe(tool, &config)
         );
+    }
+}
+
+/// 注册表校验问题打印到 stderr（保持 stdout 仍是可直接解析的表格）
+///
+/// 与 GUI 一致：只做软提示，不影响其它工具的使用，也不把退出码改成失败。
+fn warn_problems(registry: &registry::Registry) {
+    if registry.problems.is_empty() {
+        return;
+    }
+    eprintln!("警告：注册表有 {} 条问题：", registry.problems.len());
+    for problem in &registry.problems {
+        eprintln!("  - {}", problem.display());
     }
 }
 
