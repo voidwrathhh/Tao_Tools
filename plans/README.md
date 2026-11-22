@@ -24,10 +24,10 @@
 
 | 工具 | 状态 | 当前重点 | 最后更新 |
 |---|---|---|---|
-| [sertool](sertool.md) | 进行中 | 下一轮 P1：串口参数、滚动锚点/暂停跟随、日志落盘 | 2026-11-22 |
-| [friend](friend.md) | 进行中 | 下一轮 P1：配置缺省与校验、流式超时/SSE 容错 | 2026-11-22 |
-| [blueinfo](blueinfo.md) | 进行中 | 下一轮 P1：读写线程分离、协议契约加固、快捷指令条 | 2026-11-22 |
-| [deskman](deskman.md) | 进行中 | 下一轮 P1：图标后台加载、目录实时同步、拖拽到抽屉 | 2026-11-22 |
-| [copilotkey](copilotkey.md) | 进行中 | 下一轮 P1：install 轮询可靠性、state.json 可观测 | 2026-11-22 |
-| [toolhub](toolhub.md) | 进行中 | 下一轮 P1：启动参数不经 cmd 拼串、健康检查、自动发现 | 2026-11-22 |
+| [sertool](sertool.md) | 进行中 | 下一轮 P2：输入区编辑改进、发送历史、GBK 解码 | 2026-11-22 |
+| [friend](friend.md) | 进行中 | 下一轮 P2：Anthropic 兼容、对话导出、多人格、训练参数 | 2026-11-22 |
+| [blueinfo](blueinfo.md) | 进行中 | 下一轮 P2：串口参数配置、BLE、截图、多语言、导入导出、回放 | 2026-11-22 |
+| [deskman](deskman.md) | 进行中 | 下一轮 P2：favicon、窗口布局、开机自启、多屏、默认坐标 | 2026-11-22 |
+| [copilotkey](copilotkey.md) | 进行中 | 下一轮 P2：长按/双击、宏、多套配置、图形界面（未决）、机型差异 | 2026-11-22 |
+| [toolhub](toolhub.md) | 进行中 | 下一轮 P2：收藏/置顶分组、启动参数模板 | 2026-11-22 |
 | [codeedit](codeedit.md) | 待动工（未注册） | 复制 Director 源码 + 按规范改造 | 2026-09-24 |

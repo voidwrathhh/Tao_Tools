@@ -41,12 +41,12 @@ sertool connect COM3
 
 | 工具 | 版本 | 描述 |
 |------|------|------|
-| [sertool](Tools/sertool/) | v2.4.1 | 串口终端工具（TUI 界面，含设置界面与配置记忆） |
-| [friend](Tools/friend/) | v1.0.1 | AI 聊天助手（自定义 API、人格训练） |
-| [blueinfo](Tools/blueinfo/) | v1.1.1 | 通用桌面蓝牙调试工具（GUI 图形界面，含设置界面） |
-| [deskman](Tools/deskman/) | v4.3.2 | 桌面接管式图标整理器（真实图标 + 原位还原，含设置界面） |
-| [copilotkey](Tools/copilotkey/) | v1.0.2 | Copilot 键改造工具（Windows，把 Copilot 键变成全局功能键） |
-| [toolhub](Tools/toolhub/) | v1.1.0 | 工具中心（图形入口：启动工具、调整顺序、直达各工具设置） |
+| [sertool](Tools/sertool/) | v2.5.0 | 串口终端工具（TUI，含串口参数设置、日志落盘、HEX 跨块偏移） |
+| [friend](Tools/friend/) | v1.1.0 | AI 聊天助手（自定义 API、人格训练、流式超时与中断） |
+| [blueinfo](Tools/blueinfo/) | v1.2.0 | 通用桌面蓝牙调试工具（GUI，读写线程分离、定长帧协议、通道显隐） |
+| [deskman](Tools/deskman/) | v4.4.0 | 桌面接管式图标整理器（真实图标后台加载、目录实时同步、拖拽分类） |
+| [copilotkey](Tools/copilotkey/) | v1.1.0 | Copilot 键改造工具（Windows，运行态可观测、install 轮询确认） |
+| [toolhub](Tools/toolhub/) | v1.2.0 | 工具中心（图形入口、健康检查、cargo 自动发现） |
 
 > **注册约定（强制）**：每新增一个工具，都必须在 [Tools/toolhub/registry.json](Tools/toolhub/registry.json) 中登记，否则工具中心里看不到它。字段与流程见 [Tools/toolhub/README.md](Tools/toolhub/README.md)。
 
