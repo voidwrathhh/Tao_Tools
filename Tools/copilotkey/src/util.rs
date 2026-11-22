@@ -9,7 +9,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
@@ -107,6 +107,11 @@ pub fn config_path() -> PathBuf {
     app_dir().join("config.json")
 }
 
+/// 运行状态文件：守护进程写的 pid / 启动时间 / 上次触发结果。
+pub fn state_path() -> PathBuf {
+    app_dir().join("state.json")
+}
+
 pub fn log_path() -> PathBuf {
     app_dir().join("copilotkey.log")
 }
@@ -133,6 +138,56 @@ pub fn file_stamp() -> String {
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
         )
     }
+}
+
+/// 临时文件路径，带 pid 后缀：两个进程同时保存时不会互相写坏同一个临时文件。
+pub fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{}", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// 原子写：写临时文件 → `fsync` → `rename` 覆盖正式文件。
+///
+/// 任何时刻读到的要么是旧的完整内容、要么是新的完整内容，不会读到写了一半的文件。
+/// 配置（`config.rs`）与运行状态（`state.rs`）共用这一条写路径。
+pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    let tmp = tmp_path(path);
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        // 落盘后再 rename：断电/崩溃时不会留下“内容还没写完”的正式文件。
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("写入临时文件失败：{}（{}）", err, tmp.display()));
+    }
+    if let Err(err) = rename_with_retry(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "替换文件失败：{}（临时文件：{}）",
+            err,
+            tmp.display()
+        ));
+    }
+    Ok(())
+}
+
+/// rename 偶尔会撞上别的进程短暂持有句柄（杀毒软件、索引器），短暂重试几次。
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut last: Option<std::io::Error> = None;
+    for _ in 0..5 {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last = Some(err);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "重命名文件失败")))
 }
 
 /// 是否写日志（守护进程按配置开关）。

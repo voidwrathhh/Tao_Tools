@@ -18,14 +18,16 @@ mod config;
 mod hook;
 mod keys;
 mod launch;
+mod state;
 mod util;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use config::Config;
+use state::State;
 
 fn main() {
     util::ensure_console();
@@ -78,11 +80,11 @@ fn print_help() {
     out!("       target --list           列出当前可用（已编译）的 tao_tools 工具\n");
     out!("       target --clear          清除目标\n");
     out!("  run                          前台运行守护进程（一般由 install 自动拉起）\n");
-    out!("  install                      注册开机自启并立即启动守护进程\n");
+    out!("  install                      注册开机自启并启动守护进程（会轮询确认真的生效）\n");
     out!("  uninstall                    取消开机自启并停止守护进程\n");
-    out!("  status                       查看当前配置与运行状态\n");
+    out!("  status                       查看配置、上次触发结果与运行状态\n");
     out!("  stop                         停止守护进程\n");
-    out!("  test                         模拟按一次触发键，验证端到端效果\n");
+    out!("  test                         校验目标并注入一次按键，靠 state.json 确认真实触发\n");
     out!("\n示例：\n");
     out!("  copilotkey run target --list\n");
     out!("  copilotkey target deskman\n");
@@ -305,31 +307,71 @@ fn cmd_install() -> i32 {
             return 1;
         }
     }
-    match autostart::install(&exe_text) {
-        Ok(()) => out!("已注册开机自启：HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\TaoToolsCopilotKey\n"),
-        Err(err) => {
-            out!("注册开机自启失败：{}\n", err);
+
+    // 1) 注册表：写完立刻回读确认，不假设 RegSetValueExW 返回 0 就等于值是对的。
+    let expected_value = format!("\"{}\" run", exe_text);
+    if let Err(err) = autostart::install(&exe_text) {
+        out!("注册开机自启失败：{}\n", err);
+        return 1;
+    }
+    let confirmed = poll_until(Duration::from_secs(2), Duration::from_millis(50), || {
+        autostart::query().as_deref() == Some(expected_value.as_str())
+    });
+    if !confirmed {
+        out!(
+            "开机自启写入后回读不一致：期望 {}，实际 {}。\n",
+            expected_value,
+            autostart::query().unwrap_or_else(|| "（未设置）".to_string())
+        );
+        return 1;
+    }
+    out!("已注册开机自启（已回读确认）：HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\TaoToolsCopilotKey\n");
+
+    // 记下“上一次”的状态：后面用它确认新进程真的换了 pid / 启动时间。
+    let previous = state::load().ok().flatten();
+
+    // 2) 停旧进程：轮询等它真的退出，不能 sleep 完就当它退了。
+    if hook::is_running() {
+        if !hook::stop() {
+            out!("通知旧守护进程退出失败。\n");
             return 1;
         }
+        if !poll_until(Duration::from_secs(3), Duration::from_millis(100), || {
+            !hook::is_running()
+        }) {
+            out!("旧守护进程 3 秒内没有退出，为免两个进程抢钩子已中止。\n");
+            out!("请手动结束它后重试：taskkill /F /IM copilotkey.exe\n");
+            return 1;
+        }
+        out!("旧守护进程已退出。\n");
     }
 
-    if hook::is_running() {
-        hook::stop();
-        thread::sleep(Duration::from_millis(400));
-        out!("已通知旧进程退出。\n");
-    }
+    // 3) 拉起新进程并保留 Child 句柄：能立刻发现它提前退出（旧实现把句柄丢了）。
+    let mut child = match spawn_daemon(&exe) {
+        Ok(child) => child,
+        Err(err) => {
+            out!("启动守护进程失败：{}\n", err);
+            return 1;
+        }
+    };
+    let child_pid = child.id();
 
-    if let Err(err) = spawn_daemon(&exe) {
-        out!("启动守护进程失败：{}\n", err);
-        return 1;
-    }
-    thread::sleep(Duration::from_millis(900));
-    if hook::is_running() {
-        out!("守护进程已启动，全局钩子生效。\n");
-        out!("现在按下 {} 就会启动目标程序，不再弹出搜索面板。\n", config.label());
-    } else {
-        out!("守护进程没有起来，最近日志：\n{}\n", util::tail_log(15));
-        return 1;
+    // 4) 双重确认：进程还在跑（is_running）+ state.json 显示“就是这个 pid、钩子已就绪”。
+    match wait_daemon_ready(&mut child, child_pid, previous.as_ref()) {
+        Ok(started) => {
+            out!("守护进程已启动，全局钩子生效。\n");
+            out!("  pid    : {}\n", started.pid);
+            out!("  启动于 : {}\n", started.started_at);
+            out!("现在按下 {} 就会启动目标程序，不再弹出搜索面板。\n", config.label());
+        }
+        Err(err) => {
+            out!("{}\n", err);
+            let tail = util::tail_log(15);
+            if !tail.is_empty() {
+                out!("\n最近的日志：\n{}\n", tail);
+            }
+            return 1;
+        }
     }
 
     if config.target.is_empty() {
@@ -393,12 +435,68 @@ fn print_config_fields(config: &Config) {
     );
 }
 
+/// 打印 state.json 里的运行状态：pid / 启动时间 / 累计触发 / 上次触发结果。
+///
+/// 这是 `status` 的第二块信息源：即使 `log = false` 关掉日志、release 构建没有
+/// 控制台，也能看到真实的运行结果 —— 因为 state.json 由守护进程无条件原子写入。
+fn print_runtime_state(running: bool) {
+    match State::load() {
+        Ok(Some(state)) => {
+            if running {
+                out!("  运行状态：pid {}，启动于 {}\n", state.pid, state.started_at);
+            } else {
+                out!(
+                    "  运行状态：已停止（记录来自上次运行：pid {}，启动于 {}）\n",
+                    state.pid, state.started_at
+                );
+            }
+            out!(
+                "  钩子就绪：{}\n",
+                if state.hook_ready {
+                    "是"
+                } else {
+                    "否（本次启动没装成钩子）"
+                }
+            );
+            out!("  累计触发：{} 次\n", state.trigger_count);
+            let at = state
+                .last_trigger_at
+                .clone()
+                .unwrap_or_else(|| "时间未知".to_string());
+            let target = if state.last_target.is_empty() {
+                "（空）".to_string()
+            } else {
+                state.last_target.clone()
+            };
+            if state.last_outcome == state::OUTCOME_FAILED {
+                out!(
+                    "  上次触发：失败：{}\n",
+                    if state.last_error.is_empty() {
+                        "（原因未知）"
+                    } else {
+                        state.last_error.as_str()
+                    }
+                );
+                out!("            时间 {}，目标 {}\n", at, target);
+            } else if let Some(label) = state.outcome_label() {
+                out!("  上次触发：{}（{}，目标 {}）\n", label, at, target);
+            } else {
+                out!("  上次触发：（还没有触发过）\n");
+            }
+        }
+        Ok(None) => out!("  运行状态：（没有记录，守护进程从未成功启动过）\n"),
+        Err(err) => out!("  运行状态：读取失败（{}）\n", err),
+    }
+}
+
 fn cmd_status() -> i32 {
     let path = util::config_path();
     let running = hook::is_running();
+    let mut logging = true;
     out!("copilotkey v{}\n", env!("CARGO_PKG_VERSION"));
     match Config::load() {
         Ok(Some(config)) => {
+            logging = config.log;
             out!("  配置文件：{}\n", path.display());
             print_config_fields(&config);
         }
@@ -418,11 +516,15 @@ fn cmd_status() -> i32 {
             out!("  执行 copilotkey target / install 会先把原文件备份成 config.json.broken-<时间戳>，再以非零码退出。\n");
         }
     }
+    if !logging {
+        out!("  日志开关：已关闭（log = false）—— 运行结果仍记录在 state.json，下面照常可见\n");
+    }
     match autostart::query() {
         Some(value) => out!("  开机自启：已启用 → {}\n", value),
         None => out!("  开机自启：未启用\n"),
     }
     out!("  守护进程：{}\n", if running { "运行中" } else { "未运行" });
+    print_runtime_state(running);
     let tail = util::tail_log(5);
     if !tail.is_empty() {
         out!("\n最近的日志：\n{}\n", tail);
@@ -436,28 +538,196 @@ fn cmd_test() -> i32 {
         out!("还没有设置触发键。\n");
         return 1;
     }
+
+    // 1) 先静态校验目标（不启动任何东西）：目标无效就没必要注入按键。
+    if let Err(err) = check_target(&config) {
+        out!("目标校验失败：{}\n", err);
+        return 1;
+    }
+    out!("目标校验：通过（{}）\n", config.target.trim());
+
     if !hook::is_running() {
-        out!("提示：守护进程没在运行，注入的按键不会有任何反应。先执行 copilotkey install。\n");
+        out!("守护进程没在运行，注入的按键不会有任何反应。\n");
+        out!("先执行 copilotkey install，再执行 copilotkey test。\n");
+        return 1;
     }
+
+    // 注入被忽略时注入本身毫无意义（还会把按键放行给系统），直接说明清楚。
+    if config.ignore_injected {
+        out!("\n注意：配置里 ignore_injected = true，守护进程按设计会忽略程序注入的按键。\n");
+        out!("      所以注入**不能**验证钩子通路；真实按下 {} 仍然有效。\n", config.label());
+        out!("结论：目标可启动，但钩子通路未验证 —— 本次测试不算通过（也不是失败）。\n");
+        return 1;
+    }
+
+    // 2) 注入前记下基线：靠 state.json 的计数变化判断“真的触发了”，而不是假定成功。
+    let baseline = state::load().ok().flatten();
+    let before_count = baseline.as_ref().map(|state| state.trigger_count).unwrap_or(0);
+    let baseline_pid = baseline.as_ref().map(|state| state.pid);
+
     keys::send_combo(config.trigger_vk, config.trigger_mods);
-    let started = Instant::now();
-    thread::sleep(Duration::from_millis(600));
+    let confirmed = poll_until(Duration::from_secs(3), Duration::from_millis(100), || {
+        State::load()
+            .ok()
+            .flatten()
+            .map(|state| state.trigger_count > before_count)
+            .unwrap_or(false)
+    });
+
+    if !confirmed {
+        out!("\n未确认到真实触发：3 秒内 state.json 的触发计数没有增加。\n");
+        out!("可能原因：\n");
+        out!("  - 守护进程不是 v1.1.0 及以上（旧版本不写 state.json）；\n");
+        out!("  - 钩子被其它程序抢占，或触发键/修饰键与注入的组合不一致；\n");
+        out!("  - 守护进程在测试期间重启了。\n");
+        let tail = util::tail_log(5);
+        if !tail.is_empty() {
+            out!("\n最近的日志：\n{}\n", tail);
+        }
+        return 1;
+    }
+
+    let latest = match State::load() {
+        Ok(Some(state)) => state,
+        _ => {
+            out!("已确认触发计数增加，但随后读不到 state.json（可能被删除）。\n");
+            return 1;
+        }
+    };
+    if latest.pid != baseline_pid.unwrap_or(latest.pid) {
+        out!("已确认触发，但守护进程在测试期间重启过（pid 变了），结果不可靠。\n");
+        return 1;
+    }
+
+    out!("\n已确认真实触发：\n");
     out!(
-        "已模拟按下一次 {}（耗时 {} 毫秒）。\n",
-        keys::combo_label(config.trigger_vk, config.trigger_mods),
-        started.elapsed().as_millis()
+        "  累计触发：{} 次（测试前 {} 次）\n",
+        latest.trigger_count, before_count
     );
-    if config.target.is_empty() {
-        out!("当前没有设置目标程序，只会记录一条日志。\n");
+    out!(
+        "  触发时间：{}\n",
+        latest
+            .last_trigger_at
+            .clone()
+            .unwrap_or_else(|| "时间未知".to_string())
+    );
+    out!(
+        "  目标　　：{}\n",
+        if latest.last_target.is_empty() {
+            "（空）"
+        } else {
+            latest.last_target.as_str()
+        }
+    );
+    if latest.last_outcome == state::OUTCOME_FAILED {
+        out!("  结果　　：失败：{}\n", latest.last_error);
+        out!("\n钩子通路正常，但目标启动失败 —— 先修好目标再试。\n");
+        return 1;
     }
-    let tail = util::tail_log(3);
-    if !tail.is_empty() {
-        out!("\n最近的日志：\n{}\n", tail);
-    }
+    out!("  结果　　：成功\n");
+    out!("钩子通路与目标启动都正常。\n");
     0
 }
 
-fn spawn_daemon(exe: &Path) -> std::io::Result<()> {
+/// 反复调用 `condition`，直到它为真或超时；返回是否在超时前为真。
+///
+/// 抽成独立函数是为了能单测“轮询确认”这套逻辑本身（install / test 都用它）。
+fn poll_until(timeout: Duration, interval: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(interval);
+    }
+}
+
+/// 判断 state.json 是否属于「刚拉起的那个守护进程，且钩子已就绪」。
+///
+/// 两个条件缺一不可：
+/// 1. `pid` 等于子进程 pid —— 排除“旧进程还持有互斥量、新进程静默退出”的假成功；
+/// 2. `started_at` 与上一次记录不同（或此前没有记录）—— 排除 pid 被复用。
+fn daemon_ready(state: Option<&State>, child_pid: u32, previous: Option<&State>) -> bool {
+    let Some(state) = state else {
+        return false;
+    };
+    if !state.hook_ready || state.pid != child_pid {
+        return false;
+    }
+    match previous {
+        Some(previous) => previous.pid != state.pid || previous.started_at != state.started_at,
+        None => true,
+    }
+}
+
+/// 等新拉起的守护进程完成启动：`child.try_wait()` 提前发现退出，state.json 确认钩子就绪。
+fn wait_daemon_ready(
+    child: &mut Child,
+    child_pid: u32,
+    previous: Option<&State>,
+) -> Result<State, String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let code = status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "未知".to_string());
+                return Err(format!("守护进程启动后立即退出（退出码 {}）。", code));
+            }
+            Ok(None) => {}
+            Err(err) => return Err(format!("无法查询守护进程状态：{}", err)),
+        }
+        if let Ok(Some(state)) = State::load() {
+            if daemon_ready(Some(&state), child_pid, previous) && hook::is_running() {
+                return Ok(state);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "守护进程 5 秒内没有完成启动（state.json 未确认钩子就绪）。\n\
+                 请检查是否残留旧进程：taskkill /F /IM copilotkey.exe 后重试。"
+                    .to_string(),
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// 校验目标“确实有东西可以启动”：空目标、不存在的路径、没编译的工具名都算失败。
+///
+/// 只做静态检查，不启动任何程序（`test` 用它避免“注入成功但目标根本不存在”）。
+fn check_target(config: &Config) -> Result<(), String> {
+    let target = config.target.trim();
+    if target.is_empty() {
+        return Err("还没有设置目标（用 copilotkey target <程序> 设置）".to_string());
+    }
+    let lower = target.to_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("ms-") {
+        return Ok(());
+    }
+    if target.contains('\\') || target.contains('/') || lower.ends_with(".exe") {
+        if Path::new(target).exists() {
+            return Ok(());
+        }
+        return Err(format!("目标路径不存在：{}", target));
+    }
+    if let Some(repo) = repo_root() {
+        if tool_exe(&repo, target).is_some() {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "“{}” 不是已编译的 tao_tools 工具，也不是有效路径或 URL；用 copilotkey target --list 看看可用工具",
+        target
+    ))
+}
+
+fn spawn_daemon(exe: &Path) -> std::io::Result<Child> {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -468,7 +738,6 @@ fn spawn_daemon(exe: &Path) -> std::io::Result<()> {
         .stderr(Stdio::null())
         .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
         .spawn()
-        .map(|_| ())
 }
 
 /// 判断某个目录是不是 cargo workspace 根（Cargo.toml 里带 `[workspace]`）。
@@ -581,4 +850,104 @@ fn list_tools() -> i32 {
     }
     out!("\n用 copilotkey target <工具名> 即可绑定，例如 copilotkey target deskman\n");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_until_returns_immediately_when_condition_holds() {
+        let mut calls = 0;
+        assert!(poll_until(
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            || {
+                calls += 1;
+                true
+            }
+        ));
+        assert_eq!(calls, 1, "条件一开始就成立，不该多轮询");
+    }
+
+    #[test]
+    fn poll_until_waits_for_eventual_condition() {
+        let mut calls = 0;
+        assert!(poll_until(
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+            || {
+                calls += 1;
+                calls >= 3
+            }
+        ));
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn poll_until_times_out() {
+        let started = Instant::now();
+        assert!(!poll_until(
+            Duration::from_millis(120),
+            Duration::from_millis(20),
+            || false
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(120));
+    }
+
+    fn sample_state(pid: u32, started_at: &str, hook_ready: bool) -> State {
+        State {
+            pid,
+            started_at: started_at.to_string(),
+            hook_ready,
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn daemon_ready_requires_matching_pid_and_ready_hook() {
+        let current = sample_state(4242, "t1", true);
+        assert!(daemon_ready(Some(&current), 4242, None));
+
+        // pid 对不上：不是我们刚拉起的那个进程。
+        assert!(!daemon_ready(Some(&current), 4241, None));
+        // 钩子没就绪：进程起来了但钩子没装上，不能算启动成功。
+        let not_ready = sample_state(4242, "t1", false);
+        assert!(!daemon_ready(Some(&not_ready), 4242, None));
+        // 根本没有 state.json。
+        assert!(!daemon_ready(None, 4242, None));
+
+        // 与上一次记录完全相同：旧进程还持有互斥量，新进程已静默退出。
+        let previous = sample_state(4242, "t1", true);
+        assert!(!daemon_ready(Some(&current), 4242, Some(&previous)));
+
+        // pid 被复用但启动时间变了：确实是一次新的启动。
+        let restarted = sample_state(4242, "t2", true);
+        assert!(daemon_ready(Some(&restarted), 4242, Some(&previous)));
+
+        // pid 变了、启动时间也变了：新进程。
+        let replaced = sample_state(5000, "t2", true);
+        assert!(daemon_ready(Some(&replaced), 5000, Some(&previous)));
+    }
+
+    #[test]
+    fn check_target_rejects_empty_missing_and_unknown_targets() {
+        let mut config = Config::default();
+        assert!(check_target(&config)
+            .unwrap_err()
+            .contains("还没有设置目标"));
+
+        config.target = "https://example.com".to_string();
+        assert!(check_target(&config).is_ok());
+
+        config.target = "ms-settings:".to_string();
+        assert!(check_target(&config).is_ok());
+
+        config.target = r"C:\definitely\not\here\copilotkey-missing.exe".to_string();
+        let err = check_target(&config).unwrap_err();
+        assert!(err.contains("不存在"), "错误信息不对：{}", err);
+
+        config.target = "no-such-tool-xyz".to_string();
+        assert!(check_target(&config).is_err());
+    }
 }

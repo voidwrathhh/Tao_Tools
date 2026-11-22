@@ -8,7 +8,6 @@
 //!    `config.json.broken-<时间戳>` 后以非零码退出；守护进程保留内存里的 last-good。
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -143,12 +142,7 @@ impl Config {
         normalized.version = CONFIG_VERSION;
         let text = serde_json::to_string_pretty(&normalized)
             .map_err(|err| format!("序列化配置失败：{}", err))?;
-        let tmp = tmp_path(path);
-        write_tmp(&tmp, &text)?;
-        rename_with_retry(&tmp, path).map_err(|err| {
-            let _ = fs::remove_file(&tmp);
-            format!("替换配置文件失败：{}（临时文件：{}）", err, tmp.display())
-        })
+        util::write_atomic(path, &text)
     }
 
     pub fn label(&self) -> String {
@@ -195,45 +189,6 @@ fn backup_file(path: &Path) -> Option<PathBuf> {
         util::file_stamp()
     ));
     fs::rename(path, &backup).ok().map(|_| backup)
-}
-
-/// 临时文件路径，带 pid 后缀：两个进程同时保存时不会互相写坏同一个临时文件。
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".tmp-{}", std::process::id()));
-    path.with_file_name(name)
-}
-
-fn write_tmp(path: &Path, text: &str) -> Result<(), String> {
-    let result = (|| -> std::io::Result<()> {
-        let mut file = fs::File::create(path)?;
-        file.write_all(text.as_bytes())?;
-        // 落盘后再 rename：断电/崩溃时不会留下“内容还没写完”的正式文件。
-        file.sync_all()?;
-        Ok(())
-    })();
-    if let Err(err) = result {
-        let _ = fs::remove_file(path);
-        return Err(format!("写入临时配置失败：{}（{}）", err, path.display()));
-    }
-    Ok(())
-}
-
-/// rename 偶尔会撞上别的进程短暂持有句柄（杀毒软件、索引器），短暂重试几次。
-fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
-    let mut last: Option<std::io::Error> = None;
-    for _ in 0..5 {
-        match fs::rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                last = Some(err);
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-        }
-    }
-    Err(last.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "重命名配置失败")
-    }))
 }
 
 #[cfg(test)]

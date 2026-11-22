@@ -11,8 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, LPARAM, LRESULT, WPARAM, WAIT_FAILED,
-    WAIT_OBJECT_0,
+    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HANDLE, LPARAM, LRESULT,
+    WPARAM, WAIT_FAILED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
@@ -28,6 +28,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::config::Config;
 use crate::keys;
 use crate::launch;
+use crate::state;
 use crate::util;
 
 const MUTEX_NAME: &str = r"Local\TaoToolsCopilotKeyMutex";
@@ -191,11 +192,11 @@ pub fn is_running() -> bool {
     let name = util::wide(MUTEX_NAME);
     let handle = unsafe { OpenMutexW(SYNCHRONIZE, 0, name.as_ptr()) };
     if handle.is_null() {
-        false
-    } else {
-        unsafe { CloseHandle(handle) };
-        true
+        // 互斥量存在但打不开（多半是它以管理员权限运行）：同样算“有实例在跑”。
+        return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
     }
+    unsafe { CloseHandle(handle) };
+    true
 }
 
 /// 通知正在运行的守护进程退出。返回是否真的通知到了。
@@ -259,17 +260,38 @@ pub fn run(config: Config) -> i32 {
     let mutex_name = util::wide(MUTEX_NAME);
     let mutex = unsafe { CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr()) };
     if mutex.is_null() {
-        util::say(&format!("创建互斥量失败，错误码 {}\n", unsafe { GetLastError() }));
+        let code = unsafe { GetLastError() };
+        // 错误码 5 = 访问被拒：互斥量已经存在，但它的属主权限更高（例如以管理员身份启动的实例），
+        // 本进程连打开都不行。这种情况同样是“已有实例在运行”，必须用非零码告诉调用方。
+        if code == ERROR_ACCESS_DENIED {
+            util::say(
+                "已经有一个 copilotkey 守护进程在运行（当前权限不足，无法打开它的互斥量，\
+                 可能它以管理员权限启动），本次没有启动新的进程（退出码 2）。\n",
+            );
+            return 2;
+        }
+        util::say(&format!("创建互斥量失败，错误码 {}\n", code));
         return 1;
     }
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        util::say("已经有一个 copilotkey 守护进程在运行了。\n");
-        return 0;
+        // 非零码：调用方（install）必须能把“没起来”和“起来了”区分开。
+        util::say("已经有一个 copilotkey 守护进程在运行了，本次没有启动新的进程（退出码 2）。\n");
+        return 2;
     }
 
     STOPPING.store(false, Ordering::Relaxed);
     let _ = CONFIG.set(Mutex::new(config.clone()));
     apply_config(&config);
+
+    // 运行状态：先落盘 pid / 启动时间（hook_ready = false），钩子装好后再置真。
+    // 命令行（status / test / install）只读这个文件，log = false 时也能看到真实状态。
+    if let Err(err) = state::begin() {
+        util::log(&format!("写运行状态失败：{}", err));
+        util::say(&format!(
+            "警告：无法写入运行状态（{}），status / test 将看不到本次运行。\n",
+            err
+        ));
+    }
 
     let event_name = util::wide(STOP_EVENT);
     let stop_event = unsafe { CreateEventW(std::ptr::null(), 1, 0, event_name.as_ptr()) };
@@ -291,7 +313,8 @@ pub fn run(config: Config) -> i32 {
             thread::spawn(move || {
                 let target = snapshot.target.clone();
                 let args = snapshot.arguments.clone();
-                match launch::launch(&snapshot) {
+                let result = launch::launch(&snapshot);
+                match &result {
                     Ok(()) => util::log(&format!(
                         "触发 → 启动 {}{}",
                         target,
@@ -302,6 +325,11 @@ pub fn run(config: Config) -> i32 {
                         }
                     )),
                     Err(err) => util::log(&format!("触发 → 失败：{}", err)),
+                }
+                // 不论成功失败都记一笔：status / test 靠它判断真实结果，
+                // 不依赖日志开关（log = false 时日志一行都不写）。
+                if let Err(err) = state::record_trigger(&target, &result) {
+                    util::log(&format!("写运行状态失败：{}", err));
                 }
             });
         }
@@ -320,6 +348,9 @@ pub fn run(config: Config) -> i32 {
 
     // 钩子装好后再开轮询：启动失败就直接返回，不留后台线程。
     spawn_config_watcher();
+    if let Err(err) = state::set_hook_ready(true) {
+        util::log(&format!("写运行状态失败：{}", err));
+    }
 
     util::log(&format!(
         "守护进程启动：触发键 {}（vk=0x{:02X}），目标 {:?}，参数 {:?}，严格修饰键={}，拦截按键={}",

@@ -1,6 +1,6 @@
 # copilotkey 开发计划
 
-> 状态：进行中　最后更新：2026-11-22　版本基线：v1.0.2
+> 状态：进行中　最后更新：2026-11-22　版本基线：v1.1.0
 
 ## 1. 目标
 
@@ -14,19 +14,7 @@
 
 ## 3. 候选功能
 
-### P1 `install` 不再靠固定 sleep 假装成功
-
-- 证据：`src/main.rs:305-322` 是 `stop()` → sleep 400ms → `spawn_daemon` → sleep 900ms → `is_running()`；旧进程没退完时新进程在 `hook.rs:178-181` 撞 `ERROR_ALREADY_EXISTS` 直接 `return 0` 静默退出，而 `is_running()`（`hook.rs:144-153`）因旧进程仍持锁返回 true → 打印「守护进程已启动」，随后钩子彻底消失；`spawn_daemon`（`main.rs:407-419`）用 `.map(|_| ())` 丢掉子进程句柄，启动失败无从察觉。
-- 做法：stop 后轮询 `!is_running()`（≤3s，超时提示 taskkill）；spawn 保留 `Child`，轮询 `is_running()`（≤5s）+ `child.try_wait()` 双重判定，提前退出则打印退出码与 `tail_log`；`run` 撞已存在时返回非零码。
-- 验收：连续执行 20 次 `install` 均真正生效且每次 pid/启动时间都变；手动 kill 守护进程后 `install` 非零码退出并给出原因。
-- 版本：patch
-
-### P1 运行态可观测（state.json + `test` 不再假阳性）
-
-- 证据：`src/hook.rs:217` 失败只 `util::log`，而 `util.rs:131-135` 在 `log=false` 时连日志都不写，release 构建是 `windows_subsystem = "windows"` 无控制台；`src/main.rs:389,392-396` 的 `test` 只 `SendInput` 一次就打印「已模拟按下」，但 `hook.rs:96-97` 在 `ignore_injected` 时丢弃注入键 → 什么都没发生却报成功；`status`（`main.rs:353-378`）只有 `tail_log(5)`。
-- 做法：守护进程把 pid/启动时间/上次触发时间/目标/结果/累计次数原子写进 `state.json`，`status` 读它；`test` 先同步验证目标可启动，再注入验证钩子通路，并在 `ignore_injected=true` 时明确警告。
-- 验收：target 设为不存在路径后按触发键 → `status` 显示「上次触发 失败：ShellExecuteEx 错误码 2」；`log=false` 时 `status` 仍可见上次结果；`test` 在注入被忽略时给出警告但仍验证目标启动。
-- 版本：minor
+以下只列尚未完成的功能（已完成项随版本发布写进 `Tools/copilotkey/项目日志.md`）。
 
 ### P2 长按 / 双击与单次按下区分
 
@@ -53,7 +41,7 @@
 
 | 版本 | 内容 |
 |---|---|
-| v1.1.0 | P1 install 可靠性 + 运行态可观测 |
+| v1.1.0（已发布） | P1 install 可靠性（轮询确认注册表/进程/钩子就绪）+ 运行态可观测（`state.json`、`status` 真实结果、`test` 真判定） |
 | v1.2.0 | P2 长按/双击 + 宏 |
 | v1.3.0 | P2 多套配置；图形界面（若确认做） |
 
@@ -64,3 +52,6 @@
 - 图形界面若引入 GUI 框架，需要评估对「无管理员权限、开机自启轻量」的影响。
 - 精确修饰键依赖 `GetAsyncKeyState` 的实时性；安全桌面/提权前台是已知盲区（UAC 期间低级钩子收不到事件）。v1.0.2 已改成判定瞬间现算、不再累积状态，「修饰键残留导致之后一直不触发」的问题消除；但「提权前台时能否读到修饰键」仍需真机实测，不稳则退回「钩子空闲 N 秒自动清零」。
 - v1.0.2 起配置损坏会生成 `config.json.broken-<时间戳>` 且不自动清理；保留份数与是否提供 `config --repair` / `--restore` 待决。
+- v1.1.0 的 `test` 靠「注入触发键 → `state.json` 计数 +1」验证钩子通路；但 `ignore_injected = true` 时钩子按设计丢弃注入键，只能验证目标可启动，通路验证仍需真人按一次（此时 `test` 明确输出「目标可启动，但钩子通路未验证」并以非零码退出，绝不报告成功）。
+- v1.1.0 的 `install` / `test` 判定依赖 `state.json` 的 `pid` / `started_at` / `hook_ready`，与守护进程版本强耦合：用新 CLI 去确认旧版守护进程会报「5 秒内没有完成启动」。`install` 用 `current_exe` 启动守护进程，因此重新构建后必须重跑一次 `install`，否则 CLI 与 `run` 不是同一份二进制。
+- 旧实例若以管理员权限运行，`CreateMutexW` / `OpenEventW` 会直接报访问被拒（错误码 5）：v1.1.0 已把它识别为「已有实例」并非零退出，但 `install` 无法自行停掉提权进程，只能提示用户用相同或更高权限执行 `taskkill /F /IM copilotkey.exe`。这是安装可靠性的剩余边界。
