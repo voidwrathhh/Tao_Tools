@@ -24,10 +24,10 @@
 
 | 工具 | 状态 | 当前重点 | 最后更新 |
 |---|---|---|---|
-| [sertool](sertool.md) | 进行中 | 串口参数配置（数据位 / 停止位 / 校验位） | 2026-11-21 |
-| [friend](friend.md) | 规划中 | 支持非 OpenAI 格式 API（Anthropic） | 2026-11-21 |
-| [blueinfo](blueinfo.md) | 进行中 | BLE 低功耗拓展（btleplug） | 2026-11-21 |
-| [deskman](deskman.md) | 规划中 | 拖拽桌面文件到分类抽屉 | 2026-11-21 |
-| [copilotkey](copilotkey.md) | 规划中 | 长按 / 双击与单次按下区分 | 2026-11-21 |
-| [toolhub](toolhub.md) | 规划中 | 工具健康检查（版本不一致 / 可执行文件缺失） | 2026-11-21 |
+| [sertool](sertool.md) | 进行中 | P0 接收管线加固 + HEX 行拆分（v2.4.1） | 2026-11-22 |
+| [friend](friend.md) | 进行中 | P0 会话身份 / 预览 panic / 训练续聊（v1.0.1） | 2026-11-22 |
+| [blueinfo](blueinfo.md) | 进行中 | P0 重连失效 + 文本时间轴/回显污染（v1.1.1） | 2026-11-22 |
+| [deskman](deskman.md) | 进行中 | P0 显隐幂等 + 原子落盘 + Dock 动画（v4.3.2） | 2026-11-22 |
+| [copilotkey](copilotkey.md) | 进行中 | P0 原子写 + 热重载 + 精确修饰键（v1.0.2） | 2026-11-22 |
+| [toolhub](toolhub.md) | 进行中 | P0 注册表校验 + 解析缓存 + 自身禁启动（v1.1.0） | 2026-11-22 |
 | [codeedit](codeedit.md) | 待动工（未注册） | 复制 Director 源码 + 按规范改造 | 2026-09-24 |

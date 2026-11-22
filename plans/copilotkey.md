@@ -1,6 +1,6 @@
 # copilotkey 开发计划
 
-> 状态：规划中　最后更新：2026-11-21　版本基线：v1.0.1
+> 状态：进行中　最后更新：2026-11-22　版本基线：v1.0.1
 
 ## 1. 目标
 
@@ -10,28 +10,65 @@
 
 - 只做键盘钩子与目标启动；不做通用快捷键管理器（不注册任意热键）。
 - **「多套配置快速切换」与 toolhub 的「启动参数模板」是两件事**：前者切键位/目标配置（本工具），后者切某工具的命令行参数（[toolhub](toolhub.md)），不要混做。
-- 图形化配置界面是否做未决（见 P2），若做优先独立窗口。
+- 图形化配置界面是否做未决（见 P2），若做优先独立窗口；不因 GUI 引入常驻重依赖。
 
 ## 3. 候选功能
 
-### P0 长按 / 双击与单次按下区分
+### P0 配置原子写 + 解析失败不静默回退默认值 · 本轮执行
 
-- 验收：配置新增 `long_press_ms`、`double_press_ms`；单次、长按、双击可分别绑定不同 target；未触发时按键放行，不影响正常输入；判定不得让短按产生明显延迟。
+- 证据：`src/config.rs:98-101` 用 `fs::write` 直写 `config.json`（中断即留半个文件）；`config.rs:86-93` 解析失败 `unwrap_or_else` 直接 `Config::default()`；`src/hook.rs:203-207` 每次触发都重新 `Config::load()`，撞上写入中途就拿到空 target 并报「还没有设置目标」；`src/main.rs:292-296` 的 `install` 还会把默认值写回，永久覆盖用户原文件。
+- 做法：`save()` 先写 `config.json.tmp` 再 `fs::rename` 原子替换；解析失败把原文件改名 `config.json.broken-<时间戳>` 并以非零码退出，绝不静默覆盖；`load()` 返回 `Result`，守护进程用 `OnceLock<Mutex<Config>>` 保存 last-good，只有解析成功才替换；启用一直闲置的 `version` 字段（`config.rs:9-11`）做迁移分支。
+- 验收：4KB 配置写入的同时并发 200 次触发，日志不出现「未设置目标」；手工把 `config.json` 写成 `{` 后执行 `target` / `install`，原文件被备份、命令非零码退出；`status` 显示「配置已损坏，正在使用上次有效配置」。
+- 版本：patch（v1.0.2）
+- 待决：备份保留份数、是否提供 `config --repair`。
 
-### P1 一键多动作（宏）
+### P0 键位配置真正热重载（现在 `set` 后必须 `install` 重启）· 本轮执行
 
-- 验收：`target` 支持按顺序启动多个目标（或一条命令链），动作间隔可配；任一动作失败不阻断后续，日志记录每步结果。
+- 证据：`src/hook.rs:183-188` 只在 `run()` 启动时把 `trigger_vk`/`trigger_mods`/`strict_mods`/`swallow`/`ignore_injected`/`debounce_ms` 一次性写进静态原子变量，之后不再刷新；`src/main.rs:194-196`、`main.rs:157-159` 反而提示「需要重启才能生效」，与 README「已完成配置热重载」矛盾（真正热加载的只有 target/arguments/workdir，`hook.rs:203`）。
+- 做法：抽 `hook::apply_config(&Config)` 统一刷新全部静态变量与 `util::set_logging(config.log)`；启动流程与现有 300~500ms 轮询线程（`hook.rs:200-221`）都调用它；key 变化时重算 label 并写一行「配置已热更新」；解析失败时保留旧值（依赖上一条）。
+- 验收：`copilotkey set f23` 后不重启守护进程，1 秒内按 F23 即触发、原 Win+Shift+F23 不再触发；`status` 输出的键位与守护进程内一致；`learn --save` 后立即生效。
+- 版本：patch（v1.0.2）
 
-### P1 多套配置快速切换
+### P0 `strict_mods` 改为真精确匹配，且修饰键状态不再变脏 · 本轮执行
 
-- 验收：`copilotkey profile use <名字>` 在多份 profile 文件间切换；`profile list` 列出；切换不要求重启守护进程（沿用配置热重载）。
+- 证据：`src/hook.rs:99-100` 的 `mods_ok = !STRICT_MODS || (MOD_STATE & required) == required` 只验「要求的都在」，多按一个 Ctrl 照样触发，与 README「多按/少按都不触发」不符；`hook.rs:41,79-85` 用全局 `MOD_STATE` 累积修饰键，UAC/安全桌面期间低级钩子收不到事件，状态永久残留。
+- 做法：判定瞬间用 `GetAsyncKeyState` 现算 Win/Shift/Ctrl/Alt（0x5B/0x5C、0xA0/0xA1、0xA2/0xA3、0xA4/0xA5 的 0x8000 位），删除 `MOD_STATE`；精确匹配写成 `(mods & 0xF) == (required & 0xF)`；`strict_mods=false` 保持只看主键并在 `set` 时打印提示。
+- 验收：`strict_mods=true` 时按 Win+Shift+Ctrl+F23 不触发（不吞键）；在管理员窗口前台后按键仍正常触发；`trace` 打印的修饰键与真实按键一致。
+- 版本：patch（v1.0.2）
+- 待决：现网可能习惯宽松行为，改语义要在日志与 README 明说；`GetAsyncKeyState` 在提权前台的可见性需真机实测，不稳则退回「钩子空闲 N 秒自动清零」。
+
+### P1 `install` 不再靠固定 sleep 假装成功
+
+- 证据：`src/main.rs:305-322` 是 `stop()` → sleep 400ms → `spawn_daemon` → sleep 900ms → `is_running()`；旧进程没退完时新进程在 `hook.rs:178-181` 撞 `ERROR_ALREADY_EXISTS` 直接 `return 0` 静默退出，而 `is_running()`（`hook.rs:144-153`）因旧进程仍持锁返回 true → 打印「守护进程已启动」，随后钩子彻底消失；`spawn_daemon`（`main.rs:407-419`）用 `.map(|_| ())` 丢掉子进程句柄，启动失败无从察觉。
+- 做法：stop 后轮询 `!is_running()`（≤3s，超时提示 taskkill）；spawn 保留 `Child`，轮询 `is_running()`（≤5s）+ `child.try_wait()` 双重判定，提前退出则打印退出码与 `tail_log`；`run` 撞已存在时返回非零码。
+- 验收：连续执行 20 次 `install` 均真正生效且每次 pid/启动时间都变；手动 kill 守护进程后 `install` 非零码退出并给出原因。
+- 版本：patch
+
+### P1 运行态可观测（state.json + `test` 不再假阳性）
+
+- 证据：`src/hook.rs:217` 失败只 `util::log`，而 `util.rs:131-135` 在 `log=false` 时连日志都不写，release 构建是 `windows_subsystem = "windows"` 无控制台；`src/main.rs:389,392-396` 的 `test` 只 `SendInput` 一次就打印「已模拟按下」，但 `hook.rs:96-97` 在 `ignore_injected` 时丢弃注入键 → 什么都没发生却报成功；`status`（`main.rs:353-378`）只有 `tail_log(5)`。
+- 做法：守护进程把 pid/启动时间/上次触发时间/目标/结果/累计次数原子写进 `state.json`，`status` 读它；`test` 先同步验证目标可启动，再注入验证钩子通路，并在 `ignore_injected=true` 时明确警告。
+- 验收：target 设为不存在路径后按触发键 → `status` 显示「上次触发 失败：ShellExecuteEx 错误码 2」；`log=false` 时 `status` 仍可见上次结果；`test` 在注入被忽略时给出警告但仍验证目标启动。
+- 版本：minor
+
+### P2 长按 / 双击与单次按下区分
+
+- 验收：配置新增 `long_press_ms`、`double_press_ms`；单次、长按、双击可分别绑定不同 target；未触发时按键放行；长按判定总延迟有可测上限（≤120ms），不吞短按。
+
+### P2 一键多动作（宏）
+
+- 验收：`target` 支持按顺序启动多个目标，动作间隔可配；任一动作失败不阻断后续，日志记录每步结果与退出码。
+
+### P2 多套配置快速切换
+
+- 验收：`copilotkey profile use <名字>` 在多份 profile 间切换；`profile list` 列出；切换不要求重启守护进程（依赖 P0 热重载）。
 
 ### P2 图形化配置界面（未决）
 
 - 未决：独立窗口（推荐，钩子常驻态需要） vs 由 toolhub 直达一个 `settings` 窗口。**先定方案再动工**，避免两处各做一半。
 - 反向参考：`eframe` 会显著增大体积，而本工具当前是轻量 CLI。
 
-### P2 待验证：不同品牌笔记本 Copilot 键上报差异
+### P2 不同品牌笔记本 Copilot 键上报差异
 
 - 验收：用 `trace` 在至少两种机型上确认上报（`F23` / `Win+Shift+F23` / 其它），在 README 记录结论；`learn --save` 对两种都能用。
 
@@ -39,12 +76,14 @@
 
 | 版本 | 内容 |
 |---|---|
-| v1.1.0 | P0 长按 / 双击 |
-| v1.2.0 | P1 宏 + 多套配置 |
-| v1.3.0 | P2 图形界面（若确认做） |
+| v1.0.2 | P0 原子写 + 热重载 + 精确修饰键 |
+| v1.1.0 | P1 install 可靠性 + 运行态可观测 |
+| v1.2.0 | P2 长按/双击 + 宏 |
+| v1.3.0 | P2 多套配置；图形界面（若确认做） |
 
 ## 5. 风险与未决问题
 
 - 长按/双击判定天然引入延迟，可能吞掉短按；需明确「延迟上限」并在文档说明。
 - 宏并发启动的顺序、工作目录、失败回滚都要先定义清楚。
 - 图形界面若引入 GUI 框架，需要评估对「无管理员权限、开机自启轻量」的影响。
+- 精确修饰键依赖 `GetAsyncKeyState` 的实时性；安全桌面/提权前台是已知盲区，需要兜底策略而不是假设永远正确。
