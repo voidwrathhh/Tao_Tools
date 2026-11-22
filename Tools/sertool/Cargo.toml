@@ -1,6 +1,6 @@
 [package]
 name = "sertool"
-version = "2.4.0"
+version = "2.4.1"
 edition = "2021"
 description = "串口终端工具 - 扫描串口、连接通信、收发数据"
 
