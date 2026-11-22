@@ -19,6 +19,9 @@ pub struct AppConfig {
     pub log_auto_scroll: bool,
     pub axis_auto_scale: bool,
     pub quick_commands: Vec<String>,
+    /// 被用户隐藏的通道原始名（曲线不可见，重启后保持）
+    #[serde(default)]
+    pub hidden_channels: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -43,6 +46,7 @@ impl Default for AppConfig {
                 "SET_R_KI: 0.1".into(),
                 "SET_R_KD: 0.05".into(),
             ],
+            hidden_channels: Vec::new(),
         }
     }
 }
@@ -100,5 +104,37 @@ fn dirs_data_dir() -> PathBuf {
         base.join(".tao_tools")
     } else {
         PathBuf::from(".").join(".tao_tools")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_without_hidden_channels_still_loads() {
+        // 兼容 v1.1.1 及更早的 config.json（没有 hidden_channels 字段）
+        let json = r#"{
+            "last_port": "COM3",
+            "last_baud": 115200,
+            "params": [],
+            "max_samples": 2000,
+            "auto_reconnect": true,
+            "log_auto_scroll": true,
+            "axis_auto_scale": true,
+            "quick_commands": ["STATUS"]
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.hidden_channels.is_empty());
+        assert_eq!(cfg.quick_commands, vec!["STATUS".to_string()]);
+    }
+
+    #[test]
+    fn hidden_channels_round_trip() {
+        let mut cfg = AppConfig::default();
+        cfg.hidden_channels.push("CH1".into());
+        let text = serde_json::to_string(&cfg).unwrap();
+        let back: AppConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.hidden_channels, vec!["CH1".to_string()]);
     }
 }

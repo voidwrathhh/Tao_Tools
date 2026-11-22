@@ -8,6 +8,7 @@ mod comm;
 mod config;
 mod data_struct;
 mod gui;
+mod protocol;
 
 use clap::{Parser, Subcommand};
 use eframe::egui;

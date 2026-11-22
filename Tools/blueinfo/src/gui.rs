@@ -12,6 +12,7 @@ use crate::data_struct::{
     default_params, is_echo_prefix, DeviceParam, LogKind, LogLine, ParamValue, PlotChannel,
     CHART_COLORS, MAX_LOG_LINES, MAX_SAMPLES_PER_CHANNEL,
 };
+use crate::protocol::FrameStats;
 use eframe::egui::{self, Color32, RichText, ScrollArea, Vec2};
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 use std::time::{Duration, Instant};
@@ -47,8 +48,14 @@ pub struct BlueInfoApp {
     plot_time_start: Option<Instant>,
     /// 已推入曲线的最大相对时间；重连时据此把原点前移，保证时间轴连续
     plot_last_time: f64,
+    /// 被用户隐藏的通道原始名（与 config.json 同步，重启后保持）
+    hidden_channels: Vec<String>,
+    /// 正在重命名的通道：(通道索引, 编辑中的文本)；仅前端显示，不改协议键
+    channel_name_edit: Option<(usize, String)>,
 
     latest_raw: Vec<(String, f64)>,
+    /// 协议坏帧统计（来自串口线程，状态栏展示）
+    frame_stats: FrameStats,
 
     frame_times: std::collections::VecDeque<f64>,
     fps: f64,
@@ -88,6 +95,7 @@ impl BlueInfoApp {
             config.last_baud
         };
         let quick_commands = config.quick_commands.clone();
+        let hidden_channels = config.hidden_channels.clone();
 
         Self {
             comm: None,
@@ -105,7 +113,10 @@ impl BlueInfoApp {
             axis_auto_scale: true,
             plot_time_start: None,
             plot_last_time: 0.0,
+            hidden_channels,
+            channel_name_edit: None,
             latest_raw: Vec::new(),
+            frame_stats: FrameStats::default(),
             frame_times: std::collections::VecDeque::with_capacity(120),
             fps: 60.0,
             packet_count: 0,
@@ -179,6 +190,10 @@ impl BlueInfoApp {
     fn disconnect(&mut self) {
         if let Some(mut comm) = self.comm.take() {
             let _ = comm.disconnect();
+            // 断开瞬间后台可能刚写入残余数据：先取走再释放，避免丢日志
+            self.comm = Some(comm);
+            self.poll_serial();
+            self.comm = None;
         }
         self.user_disconnected = true;
         self.reconnect_attempts = 0;
@@ -199,6 +214,17 @@ impl BlueInfoApp {
             self.log_err("[错误] 串口未连接");
         }
         self.text_input.clear();
+    }
+
+    /// 快捷指令条：点击按钮立即发送预设文本
+    fn send_command(&mut self, cmd: &str) {
+        if let Some(ref comm) = self.comm {
+            if let Err(e) = comm.send_text(cmd) {
+                self.log_err(format!("[发送失败] {}", e));
+            }
+        } else {
+            self.log_err("[错误] 串口未连接");
+        }
     }
 
     fn send_params(&mut self) {
@@ -228,7 +254,8 @@ impl BlueInfoApp {
         self.log_info("[参数] 已恢复默认值");
     }
 
-    fn save_config(&mut self) {
+    /// 由当前界面状态构造待落盘配置（保存与通道显隐共用，保证同源）
+    fn build_config(&self) -> AppConfig {
         let params: Vec<DeviceParam> = self
             .params
             .iter()
@@ -249,14 +276,34 @@ impl BlueInfoApp {
             log_auto_scroll: self.log_auto_scroll,
             axis_auto_scale: self.axis_auto_scale,
             quick_commands: self.custom_commands.clone(),
+            hidden_channels: self.hidden_channels.clone(),
         };
         if let Some(ref comm) = self.comm {
             cfg.last_port = comm.port_name.clone();
             cfg.last_baud = comm.baud_rate;
         }
+        cfg
+    }
+
+    fn save_config(&mut self) {
+        let cfg = self.build_config();
         cfg.save();
         self.config = cfg;
+        // 设置窗口里刚改的快捷指令立即生效，不必重启主界面
+        self.custom_commands = self.config.quick_commands.clone();
         self.log_info("[配置] 已保存到 ~/.tao_tools/blueinfo/config.json");
+    }
+
+    /// 通道勾选变化：更新可见性、同步隐藏名单并立即落盘（重启后保持）
+    fn set_channel_visible(&mut self, idx: usize, visible: bool) {
+        if let Some(ch) = self.plot_channels.get_mut(idx) {
+            ch.visible = visible;
+            let name = ch.name.clone();
+            update_hidden(&mut self.hidden_channels, &name, visible);
+        }
+        let cfg = self.build_config();
+        cfg.save();
+        self.config = cfg;
     }
 
     fn export_log(&mut self) {
@@ -314,7 +361,7 @@ impl BlueInfoApp {
         self.latest_raw = self
             .plot_channels
             .iter()
-            .map(|c| (c.name.clone(), c.last_value().unwrap_or(0.0)))
+            .map(|c| (c.label().to_string(), c.last_value().unwrap_or(0.0)))
             .collect();
     }
 
@@ -322,9 +369,12 @@ impl BlueInfoApp {
         let idx = match self.plot_channels.iter().position(|c| c.name == key) {
             Some(i) => i,
             None => {
-                let color = CHART_COLORS[self.plot_channels.len() % CHART_COLORS.len()];
-                self.plot_channels.push(PlotChannel::new(key, color));
-                self.plot_channels.len() - 1
+                let idx = self.plot_channels.len();
+                let color = CHART_COLORS[idx % CHART_COLORS.len()];
+                let mut channel = PlotChannel::new(key, color);
+                channel.visible = !self.hidden_channels.iter().any(|n| n == key);
+                self.plot_channels.push(channel);
+                idx
             }
         };
         self.plot_channels[idx].push(t, val);
@@ -339,6 +389,7 @@ impl BlueInfoApp {
         };
         let lines = comm.drain_lines();
         let packets = comm.drain_packets();
+        self.frame_stats = comm.frame_stats();
         self.comm = Some(comm);
 
         for line in lines {
@@ -358,7 +409,9 @@ impl BlueInfoApp {
                 let idx = self.plot_channels.len();
                 let color = CHART_COLORS[idx % CHART_COLORS.len()];
                 let name = format!("CH{}", idx + 1);
-                self.plot_channels.push(PlotChannel::new(&name, color));
+                let mut channel = PlotChannel::new(&name, color);
+                channel.visible = !self.hidden_channels.iter().any(|n| n == &name);
+                self.plot_channels.push(channel);
             }
             for (i, val) in tp.packet.channel_data.iter().enumerate() {
                 if i < self.plot_channels.len() {
@@ -451,6 +504,18 @@ fn current_port_label(app: &BlueInfoApp) -> String {
 //
 // 只有 Rx 且非回显前缀（">>> " / "[..]"）的行才会进入本函数，见 poll_serial。
 // 支持的格式："KEY: value" 与 "KEY = value"，键名不含空白、长度 < 20。
+
+/// 维护「持久化的隐藏通道名单」：按通道原始名增删，重复操作幂等
+fn update_hidden(hidden: &mut Vec<String>, name: &str, visible: bool) {
+    let pos = hidden.iter().position(|n| n == name);
+    match (visible, pos) {
+        (true, Some(i)) => {
+            hidden.remove(i);
+        }
+        (false, None) => hidden.push(name.to_string()),
+        _ => {}
+    }
+}
 
 fn parse_text_value(line: &str) -> Option<(&str, f64)> {
     let valid_key = |key: &str| !key.is_empty() && key.len() < 20 && !key.contains(char::is_whitespace);
@@ -636,6 +701,7 @@ fn settings_panel(ctx: &egui::Context, app: &mut BlueInfoApp) {
 fn left_panel(ui: &mut egui::Ui, app: &mut BlueInfoApp) {
     // ── 1. 连接配置 ──
     egui::CollapsingHeader::new("蓝牙设备")
+        .id_salt("device_conn")
         .default_open(true)
         .show(ui, |ui| {
             ui.add_space(4.0);
@@ -688,7 +754,8 @@ fn left_panel(ui: &mut egui::Ui, app: &mut BlueInfoApp) {
     ui.separator();
 
     // ── 2. 参数调试 ──
-    egui::CollapsingHeader::new("蓝牙设备")
+    egui::CollapsingHeader::new("参数调试")
+        .id_salt("param_debug")
         .default_open(true)
         .show(ui, |ui| {
             ui.add_space(4.0);
@@ -810,6 +877,24 @@ fn left_panel(ui: &mut egui::Ui, app: &mut BlueInfoApp) {
                 }
             });
 
+            // 快捷指令条：设置里配置的命令直接渲染成按钮，点击即发送
+            if !app.custom_commands.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new("快捷指令").small().weak());
+                let cmds = app.custom_commands.clone();
+                ui.horizontal_wrapped(|ui| {
+                    for cmd in &cmds {
+                        if ui
+                            .button(RichText::new(cmd).size(12.0))
+                            .on_hover_text("点击发送该指令")
+                            .clicked()
+                        {
+                            app.send_command(cmd);
+                        }
+                    }
+                });
+            }
+
             ui.add_space(4.0);
 
             let log_height = ui.available_height().max(80.0);
@@ -876,6 +961,9 @@ fn left_panel(ui: &mut egui::Ui, app: &mut BlueInfoApp) {
 // ─── 右侧绘图区 ────────────────────────────────────────────
 
 fn plot_panel(ui: &mut egui::Ui, app: &mut BlueInfoApp) {
+    channel_bar(ui, app);
+    ui.add_space(2.0);
+
     let plot = Plot::new("main_plot")
         .legend(Legend::default())
         .show_grid(true)
@@ -897,7 +985,7 @@ fn plot_panel(ui: &mut egui::Ui, app: &mut BlueInfoApp) {
                 continue;
             }
             let ch_color = parse_color(&channel.color);
-            let ch_name = channel.name.clone();
+            let ch_name = channel.label().to_string();
             let ch_len = channel.len();
             let line = Line::new(PlotPoints::new(pts_data))
                 .name(format!("{} ({}pts)", ch_name, ch_len))
@@ -907,6 +995,88 @@ fn plot_panel(ui: &mut egui::Ui, app: &mut BlueInfoApp) {
         }
     });
 }
+
+// ─── 绘图区顶部：通道显隐 / 重命名 ─────────────────────────
+
+fn channel_bar(ui: &mut egui::Ui, app: &mut BlueInfoApp) {
+    if app.plot_channels.is_empty() {
+        return;
+    }
+
+    let mut toggled: Option<(usize, bool)> = None;
+    let mut rename_request: Option<(usize, String)> = None;
+    let editing = app.channel_name_edit.clone();
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("通道").small().weak());
+        for idx in 0..app.plot_channels.len() {
+            let label = app.plot_channels[idx].label().to_string();
+            let mut visible = app.plot_channels[idx].visible;
+            let is_editing = matches!(&editing, Some((i, _)) if *i == idx);
+            if ui
+                .checkbox(&mut visible, "")
+                .on_hover_text("勾选显示/隐藏该通道曲线")
+                .changed()
+            {
+                toggled = Some((idx, visible));
+            }
+            if is_editing {
+                ui.label(RichText::new("编辑中…").size(12.0).weak());
+            } else if ui
+                .selectable_label(false, RichText::new(&label).size(12.0))
+                .on_hover_text("双击重命名（仅前端显示，不改协议键）")
+                .double_clicked()
+            {
+                rename_request = Some((idx, label));
+            }
+        }
+    });
+
+    if let Some((idx, visible)) = toggled {
+        app.set_channel_visible(idx, visible);
+    }
+    if let Some(pair) = rename_request {
+        app.channel_name_edit = Some(pair);
+    }
+
+    // 重命名编辑行：回车/确定提交，Esc/取消放弃
+    if let Some((idx, mut text)) = app.channel_name_edit.take() {
+        if idx >= app.plot_channels.len() {
+            return;
+        }
+        let mut commit = false;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("重命名 {}:", app.plot_channels[idx].name))
+                    .small()
+                    .weak(),
+            );
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .desired_width(180.0)
+                    .hint_text("仅前端显示"),
+            );
+            if ui.button("确定").clicked()
+                || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+            {
+                commit = true;
+            }
+            if ui.button("取消").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                cancel = true;
+            }
+        });
+        if commit {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                app.plot_channels[idx].display_name = Some(trimmed.to_string());
+            }
+        } else if !cancel {
+            app.channel_name_edit = Some((idx, text));
+        }
+    }
+}
+
 // ─── 底部状态栏 ───────────────────────────────────────────
 fn status_bar(ui: &mut egui::Ui, app: &mut BlueInfoApp) {
     ui.horizontal(|ui| {
@@ -941,6 +1111,14 @@ fn status_bar(ui: &mut egui::Ui, app: &mut BlueInfoApp) {
         }
         ui.separator();
         ui.label(format!("采样: {}", app.packet_count));
+        if app.frame_stats.bad_frames > 0 {
+            ui.separator();
+            ui.colored_label(
+                Color32::from_rgb(255, 170, 90),
+                format!("坏帧: {}", app.frame_stats.bad_frames),
+            )
+            .on_hover_text("协议解析失败并重同步的帧数（详见日志 [协议] 行）");
+        }
         ui.separator();
         for (name, val) in &app.latest_raw {
             ui.label(
@@ -1017,6 +1195,34 @@ fn parse_color(hex: &str) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_channel_list_is_idempotent() {
+        let mut hidden: Vec<String> = Vec::new();
+        update_hidden(&mut hidden, "CH1", false);
+        update_hidden(&mut hidden, "CH1", false);
+        assert_eq!(hidden, vec!["CH1".to_string()]);
+        update_hidden(&mut hidden, "CH2", false);
+        assert_eq!(hidden.len(), 2);
+        update_hidden(&mut hidden, "CH1", true);
+        assert_eq!(hidden, vec!["CH2".to_string()]);
+        // 重复恢复可见不会产生重复项或 panic
+        update_hidden(&mut hidden, "CH1", true);
+        assert_eq!(hidden, vec!["CH2".to_string()]);
+        update_hidden(&mut hidden, "CH2", true);
+        assert!(hidden.is_empty());
+    }
+
+    #[test]
+    fn hidden_channels_stay_hidden_when_recreated() {
+        let mut app = BlueInfoApp::new(false);
+        app.hidden_channels = vec!["CH1".to_string()];
+        app.plot_channels.clear();
+        app.push_text_sample("CH1", 1.0, 0.0);
+        app.push_text_sample("CH2", 2.0, 0.1);
+        assert!(!app.plot_channels[0].visible, "隐藏通道不应因重建而复活");
+        assert!(app.plot_channels[1].visible);
+    }
 
     #[test]
     fn echo_and_log_lines_never_become_channels() {

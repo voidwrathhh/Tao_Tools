@@ -6,22 +6,14 @@
 //   3. DeviceParam  — 设备参数项
 //   4. ParamValue   — UI 参数编辑状态
 //
-// ─── C 语言结构体对齐参考 ───
-// 若在嵌入式设备（C 语言）侧发送二进制帧，建议定义如下结构体：
-//
-//   #pragma pack(1)  // 字节对齐，取消 padding
-//   typedef struct {
-//       uint8_t  magic[4];      // "BLUE" 魔数
-//       uint32_t length;        // 载荷长度（小端序）
-//       double   timestamp;     // 时间戳（秒）
-//       uint8_t  channel_count; // 通道数量
-//       double   channels[8];   // 各通道数值
-//       uint32_t checksum;      // 简单 XOR 校验和
-//   } BluePacket;
-//   #pragma pack()
-//
-// Rust 侧 bincode 序列化默认使用小端序 + 紧凑格式，
-// 与 C 层 pack(1) 对齐后二进制布局完全一致。
+// ─── 线上格式（协议契约）───
+// 帧 = [4B "BLUE"] [4B 载荷长度(u32 LE)] [bincode 载荷]
+// bincode 1 定长（fixint）编码的载荷布局固定为：
+//   f64 timestamp(8) | u8 channel_count(1) | u64 Vec 长度前缀(8) | f64 × count
+//   即载荷长度 = 17 + 8 * count
+// 没有 padding、没有 checksum 字段。C 侧发帧请按下表逐字节写，
+// 不要直接发送 #pragma pack 的结构体（Vec 前缀是 u64，不是 u8/u32）。
+// 解析与坏帧处理见 protocol.rs，完整 C 示例见 README「二进制协议」。
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -208,7 +200,10 @@ impl ParamValue {
 
 /// 单条曲线通道，内部使用定长 `VecDeque` 环形队列
 pub struct PlotChannel {
+    /// 通道原始名（来自协议/文本键名，用于持久化隐藏名单与查找）
     pub name: String,
+    /// 仅前端显示用的重命名（双击通道名修改，不影响协议与持久化键）
+    pub display_name: Option<String>,
     pub color: String,
     pub visible: bool,
     data: VecDeque<[f64; 2]>,
@@ -221,6 +216,7 @@ impl PlotChannel {
     pub fn new(name: &str, color: &str) -> Self {
         Self {
             name: name.to_string(),
+            display_name: None,
             color: color.to_string(),
             visible: true,
             data: VecDeque::with_capacity(MAX_SAMPLES_PER_CHANNEL),
@@ -257,6 +253,11 @@ impl PlotChannel {
     /// 当前采样数
     pub fn len(&self) -> usize {
         self.data.len()
+    }
+
+    /// 界面显示名：重命名优先，否则用通道原始名
+    pub fn label(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.name)
     }
 
     /// 最近一个采样值（无数据时返回 None），用于按通道顺序展示实时数值

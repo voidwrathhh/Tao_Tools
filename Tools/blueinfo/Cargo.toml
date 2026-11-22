@@ -1,6 +1,6 @@
 [package]
 name = "blueinfo"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2021"
 description = "通用桌面蓝牙调试工具 - GUI 图形界面"
 
