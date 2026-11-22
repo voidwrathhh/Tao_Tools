@@ -28,7 +28,8 @@ pub fn scan_into_config(config: &mut AppConfig) -> Result<usize, String> {
     Ok(added)
 }
 
-pub fn scan_desktop_items(config: &AppConfig) -> Result<Vec<DesktopItem>, String> {
+/// 当前配置下需要监视/扫描的桌面根目录
+pub fn scan_roots(config: &AppConfig) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if config.scan.include_user_desktop {
         if let Some(path) = dirs::desktop_dir() {
@@ -38,9 +39,36 @@ pub fn scan_desktop_items(config: &AppConfig) -> Result<Vec<DesktopItem>, String
     if config.scan.include_public_desktop {
         roots.push(PathBuf::from("C:\\Users\\Public\\Desktop"));
     }
+    roots
+}
 
+/// 路径是否在忽略清单里（大小写不敏感）
+pub fn is_ignored(config: &AppConfig, path: &Path) -> bool {
+    let key = path.to_string_lossy().to_lowercase();
+    config.scan.ignore.iter().any(|ignored| ignored == &key)
+}
+
+/// 把路径加入忽略清单；返回是否新增
+pub fn add_ignored(config: &mut AppConfig, path: &Path) -> bool {
+    let key = path.to_string_lossy().trim().to_lowercase();
+    if key.is_empty() || config.scan.ignore.iter().any(|ignored| ignored == &key) {
+        return false;
+    }
+    config.scan.ignore.push(key);
+    true
+}
+
+/// 从忽略清单移除路径（用户主动把文件拖回面板时撤销忽略）
+pub fn remove_ignored(config: &mut AppConfig, path: &Path) -> bool {
+    let key = path.to_string_lossy().trim().to_lowercase();
+    let before = config.scan.ignore.len();
+    config.scan.ignore.retain(|ignored| ignored != &key);
+    before != config.scan.ignore.len()
+}
+
+pub fn scan_desktop_items(config: &AppConfig) -> Result<Vec<DesktopItem>, String> {
     let mut items = Vec::new();
-    for root in roots {
+    for root in scan_roots(config) {
         if !root.exists() {
             continue;
         }
@@ -52,7 +80,7 @@ pub fn scan_desktop_items(config: &AppConfig) -> Result<Vec<DesktopItem>, String
                 Err(_) => continue,
             };
             let path = entry.path();
-            if is_hidden_system_name(&path) {
+            if is_hidden_system_name(&path) || is_ignored(config, &path) {
                 continue;
             }
             if let Some(item) = item_from_path(&path) {
@@ -62,6 +90,67 @@ pub fn scan_desktop_items(config: &AppConfig) -> Result<Vec<DesktopItem>, String
     }
     items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     Ok(items)
+}
+
+/// 读取桌面根目录当前的全部条目（不含桌面系统文件），用于实时同步比较
+pub fn snapshot_paths(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for root in roots {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_hidden_system_name(&path) {
+                continue;
+            }
+            paths.push(path);
+        }
+    }
+    paths.sort_by_key(|path| path.to_string_lossy().to_lowercase());
+    paths
+}
+
+/// 实时同步一次快照：只把新出现的文件补进「未分类」，不自动删除已分类项目
+/// （文件消失由 UI 侧按路径存在性标记 missing，交给用户决定）。
+pub struct SnapshotOutcome {
+    pub added: usize,
+}
+
+pub fn apply_snapshot(config: &mut AppConfig, snapshot: &[PathBuf]) -> SnapshotOutcome {
+    let mut existing: HashSet<String> = config
+        .groups
+        .iter()
+        .flat_map(|group| group.items.iter().map(|item| item.path.to_lowercase()))
+        .collect();
+    let mut new_items = Vec::new();
+    for path in snapshot {
+        if is_hidden_system_name(path) || is_ignored(config, path) {
+            continue;
+        }
+        let key = path.to_string_lossy().to_lowercase();
+        if existing.contains(&key) {
+            continue;
+        }
+        if !path.exists() {
+            continue;
+        }
+        if let Some(item) = item_from_path(path) {
+            existing.insert(key);
+            new_items.push(item);
+        }
+    }
+    if new_items.is_empty() {
+        return SnapshotOutcome { added: 0 };
+    }
+    let group_index = ensure_unclassified_group(config);
+    let mut added = 0usize;
+    for item in new_items {
+        config.groups[group_index].items.push(item);
+        place_item_in_group(&mut config.groups[group_index]);
+        added += 1;
+    }
+    SnapshotOutcome { added }
 }
 
 pub fn open_item(item: &DesktopItem) -> Result<(), String> {
@@ -148,7 +237,7 @@ fn open_shell_path(_path: &str) -> Result<(), String> {
     Err("桌面项目打开功能当前仅支持 Windows".to_string())
 }
 
-fn item_from_path(path: &Path) -> Option<DesktopItem> {
+pub(crate) fn item_from_path(path: &Path) -> Option<DesktopItem> {
     let name = path.file_stem()?.to_string_lossy().to_string();
     let kind = if path.is_dir() {
         DesktopItemKind::Folder
@@ -482,4 +571,94 @@ unsafe fn hicon_to_rgba(hicon: HICON) -> Option<(Vec<u8>, usize, usize)> {
 #[cfg(not(windows))]
 pub fn extract_icon_rgba(_path: &str) -> Option<(Vec<u8>, usize, usize)> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use std::fs;
+
+    /// 每个测试独立的临时目录（避免并发测试互相干扰）
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deskman-test-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("创建测试目录失败");
+        dir
+    }
+
+    fn total_items(config: &AppConfig) -> usize {
+        config.groups.iter().map(|group| group.items.len()).sum()
+    }
+
+    #[test]
+    fn apply_snapshot_adds_new_files_once() {
+        let dir = temp_dir("snapshot-add");
+        let file = dir.join("a.txt");
+        fs::write(&file, b"x").unwrap();
+        let mut config = AppConfig::default();
+        let base = total_items(&config);
+
+        let outcome = apply_snapshot(&mut config, &[file.clone()]);
+        assert_eq!(outcome.added, 1);
+        assert_eq!(total_items(&config), base + 1);
+
+        // 同一路径再次同步不会重复插入
+        let again = apply_snapshot(&mut config, &[file]);
+        assert_eq!(again.added, 0);
+        assert_eq!(total_items(&config), base + 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_snapshot_skips_ignored_and_system_names() {
+        let dir = temp_dir("snapshot-ignore");
+        let ignored = dir.join("ignored.txt");
+        let desktop_ini = dir.join("desktop.ini");
+        fs::write(&ignored, b"x").unwrap();
+        fs::write(&desktop_ini, b"x").unwrap();
+
+        let mut config = AppConfig::default();
+        assert!(add_ignored(&mut config, &ignored));
+        let base = total_items(&config);
+        let outcome = apply_snapshot(&mut config, &[ignored.clone(), desktop_ini.clone()]);
+        assert_eq!(outcome.added, 0);
+        assert_eq!(total_items(&config), base);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ignore_list_is_case_insensitive_and_removable() {
+        let mut config = AppConfig::default();
+        let path = PathBuf::from(r"C:\Users\Someone\Desktop\Report.TXT");
+        assert!(add_ignored(&mut config, &path));
+        assert!(!add_ignored(&mut config, &path), "重复加入应返回 false");
+        assert!(is_ignored(&config, &path));
+        assert!(is_ignored(
+            &config,
+            Path::new(r"c:\users\someone\desktop\report.txt")
+        ));
+        assert!(remove_ignored(&mut config, &path));
+        assert!(!is_ignored(&config, &path));
+    }
+
+    #[test]
+    fn snapshot_paths_filters_system_files_and_missing_roots() {
+        let dir = temp_dir("snapshot-paths");
+        fs::write(dir.join("visible.txt"), b"x").unwrap();
+        fs::write(dir.join("desktop.ini"), b"x").unwrap();
+        let missing = dir.join("does-not-exist");
+
+        let paths = snapshot_paths(&[dir.clone(), missing]);
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("visible.txt"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

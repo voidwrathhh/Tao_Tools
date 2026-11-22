@@ -83,10 +83,27 @@ impl Default for DockConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ScanConfig {
     pub include_user_desktop: bool,
     pub include_public_desktop: bool,
     pub show_unclassified: bool,
+    /// 桌面目录变更实时同步（后台线程轮询，约 1 秒一次）
+    pub live_sync: bool,
+    /// 忽略清单：小写完整路径；扫描与实时同步都会跳过，从面板移除的项目写在这里
+    pub ignore: Vec<String>,
+}
+
+impl Default for ScanConfig {
+    fn default() -> Self {
+        Self {
+            include_user_desktop: true,
+            include_public_desktop: true,
+            show_unclassified: true,
+            live_sync: true,
+            ignore: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,7 +144,7 @@ pub struct DesktopItem {
     pub y: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DesktopItemKind {
     Shortcut,
@@ -142,11 +159,7 @@ impl Default for AppConfig {
         Self {
             locked: true,
             desktop: DesktopConfig::default(),
-            scan: ScanConfig {
-                include_user_desktop: true,
-                include_public_desktop: true,
-                show_unclassified: true,
-            },
+            scan: ScanConfig::default(),
             groups: default_groups(),
             dock: DockConfig::default(),
         }
@@ -210,15 +223,18 @@ impl AppConfig {
     }
 
     pub fn save(&self) {
-        let path = config_path();
-        match serde_json::to_string_pretty(self) {
-            Ok(content) => {
-                if let Err(e) = write_json_atomic(&path, &content) {
-                    eprintln!("警告：无法保存配置 {} - {}", path.display(), e);
-                }
-            }
-            Err(e) => eprintln!("警告：配置序列化失败 - {}", e),
+        if let Err(e) = self.save_result() {
+            eprintln!("警告：无法保存配置 - {}", e);
         }
+    }
+
+    /// 与 `save` 相同，但把失败原因返回给调用方（拖拽添加等需要回滚的场景）
+    pub fn save_result(&self) -> Result<(), String> {
+        let path = config_path();
+        let content = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("配置序列化失败：{}", e))?;
+        write_json_atomic(&path, &content)
+            .map_err(|e| format!("写入 {} 失败：{}", path.display(), e))
     }
 }
 

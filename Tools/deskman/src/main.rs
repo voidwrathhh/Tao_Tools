@@ -1,7 +1,9 @@
 mod config;
 mod desktop;
 mod desktop_list;
+mod desktop_watch;
 mod gui;
+mod icon_store;
 mod tools;
 mod tray;
 mod window;

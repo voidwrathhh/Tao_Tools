@@ -1,12 +1,16 @@
 use crate::config::{AppConfig, DesktopItem, DesktopItemKind, DesktopState, GroupLayout};
 use crate::desktop;
 use crate::desktop_list;
+use crate::desktop_watch::DesktopWatcher;
+use crate::icon_store::IconStore;
 use crate::tray::{self, TrayCommand, TrayController};
 use eframe::egui::{
     self, Align, Align2, Area, Color32, CornerRadius, CursorIcon, FontId, Frame, Id, Margin, Pos2,
     Rect, RichText, ScrollArea, Sense, Stroke, Vec2,
 };
-use std::time::Instant;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 // ---------- 主题色板（参考 DeskBox 深色玻璃风格） ----------
 const ACCENT: Color32 = Color32::from_rgb(186, 132, 255);
@@ -109,7 +113,20 @@ struct DeskmanApp {
     applied_fullscreen: Option<bool>,
     applied_size: [f32; 2],
     delete_confirm: Option<(usize, Instant)>,
-    icon_textures: std::collections::HashMap<String, Option<egui::TextureHandle>>,
+    /// 后台提取 + 有界缓存的真实图标（见 icon_store）
+    icons: IconStore,
+    /// 路径已不存在的项目（小写完整路径），tile 灰显提示「缺失」
+    missing_paths: HashSet<String>,
+    /// 桌面目录实时同步（轮询线程）；关闭实时同步时为 None
+    watcher: Option<DesktopWatcher>,
+    /// 已交给 watcher 的监视目录，避免每帧重新解析系统桌面路径
+    watch_roots: Vec<PathBuf>,
+    /// 当前帧各分类面板的屏幕矩形，用于拖放命中测试
+    group_rects: Vec<(usize, Rect)>,
+    /// 外部文件悬停在哪个分类上（拖放高亮）
+    drop_target: Option<usize>,
+    /// 帧耗时日志节流
+    last_perf_log: Option<Instant>,
     state: DesktopState,
     system_icon_size: Option<f32>,
     dock_scroll: f32,
@@ -129,6 +146,16 @@ impl DeskmanApp {
             config.locked = true;
         }
         let size = [config.desktop.width, config.desktop.height];
+        let watch_roots = if !settings_only && config.scan.live_sync {
+            desktop::scan_roots(&config)
+        } else {
+            Vec::new()
+        };
+        let watcher = if !settings_only && config.scan.live_sync {
+            Some(DesktopWatcher::spawn(watch_roots.clone()))
+        } else {
+            None
+        };
         Self {
             config,
             tray,
@@ -148,7 +175,13 @@ impl DeskmanApp {
             applied_fullscreen: None,
             applied_size: size,
             delete_confirm: None,
-            icon_textures: std::collections::HashMap::new(),
+            icons: IconStore::new(),
+            missing_paths: HashSet::new(),
+            watcher,
+            watch_roots,
+            group_rects: Vec::new(),
+            drop_target: None,
+            last_perf_log: None,
             state: DesktopState::load(),
             system_icon_size: None,
             dock_scroll: 0.0,
@@ -174,10 +207,162 @@ impl DeskmanApp {
         match desktop::scan_into_config(&mut self.config) {
             Ok(count) => {
                 self.config.save();
+                self.refresh_missing();
+                self.prune_icons();
                 self.set_status(format!("已导入 {} 个桌面项目", count));
             }
             Err(e) => self.set_status(format!("扫描失败：{}", e)),
         }
+    }
+
+    /// 每约 3 秒刷新一次「文件已不存在」标记：只做 stat，不删除项目
+    fn refresh_missing(&mut self) {
+        let mut missing = HashSet::new();
+        for group in &self.config.groups {
+            for item in &group.items {
+                if item.kind == DesktopItemKind::Command || item.path.is_empty() {
+                    continue;
+                }
+                if !std::path::Path::new(&item.path).exists() {
+                    missing.insert(item.path.to_lowercase());
+                }
+            }
+        }
+        self.missing_paths = missing;
+    }
+
+    fn is_missing(&self, item: &DesktopItem) -> bool {
+        item.kind != DesktopItemKind::Command
+            && !item.path.is_empty()
+            && self.missing_paths.contains(&item.path.to_lowercase())
+    }
+
+    /// 丢弃面板/Dock 已不再引用的图标缓存
+    fn prune_icons(&mut self) {
+        let keep: HashSet<String> = self
+            .config
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter())
+            .chain(self.config.dock.items.iter())
+            .map(|item| item.path.to_lowercase())
+            .collect();
+        self.icons.prune_to(&keep);
+    }
+
+    /// 依据配置开关启停桌面目录实时同步线程
+    fn sync_live_watch(&mut self) {
+        if !self.config.scan.live_sync {
+            if self.watcher.take().is_some() {
+                self.watch_roots.clear();
+            }
+            return;
+        }
+        // 监视目录只在启动/每约 3 秒（或还没启动线程）时解析一次，避免每帧调系统接口
+        if self.watcher.is_none() || self.tick % 30 == 0 {
+            let roots = desktop::scan_roots(&self.config);
+            if self.watcher.is_none() {
+                self.watcher = Some(DesktopWatcher::spawn(roots.clone()));
+                self.watch_roots = roots;
+            } else if roots != self.watch_roots {
+                if let Some(watcher) = &self.watcher {
+                    watcher.set_roots(roots.clone());
+                }
+                self.watch_roots = roots;
+            }
+        }
+    }
+
+    /// 消费实时同步快照：新文件补进「未分类」，已分类项目不自动删除
+    fn handle_watcher(&mut self) {
+        let Some(watcher) = &self.watcher else {
+            return;
+        };
+        let mut snapshots = Vec::new();
+        while let Some(snapshot) = watcher.try_recv() {
+            snapshots.push(snapshot);
+        }
+        for snapshot in snapshots {
+            let outcome = desktop::apply_snapshot(&mut self.config, &snapshot);
+            if outcome.added > 0 {
+                self.config.save();
+                self.prune_icons();
+                self.set_status(format!(
+                    "桌面有 {} 个新项目，已加入「未分类」",
+                    outcome.added
+                ));
+            }
+        }
+    }
+
+    /// 把外部拖入的文件加入指定分类；校验在前、写入失败整批回滚
+    fn add_paths_to_group(&mut self, group_index: usize, paths: &[PathBuf]) {
+        if group_index >= self.config.groups.len() || paths.is_empty() {
+            return;
+        }
+        let group_name = self.config.groups[group_index].name.clone();
+        let mut existing: HashSet<String> = self
+            .config
+            .groups
+            .iter()
+            .flat_map(|group| group.items.iter().map(|item| item.path.to_lowercase()))
+            .collect();
+
+        let mut accepted = Vec::new();
+        let mut duplicated = 0usize;
+        let mut invalid = 0usize;
+        for path in paths {
+            if !path.exists() {
+                invalid += 1;
+                continue;
+            }
+            let key = path.to_string_lossy().to_lowercase();
+            if !existing.insert(key) {
+                duplicated += 1;
+                continue;
+            }
+            // 用户主动拖回被忽略的文件：撤销忽略
+            desktop::remove_ignored(&mut self.config, path);
+            match desktop::item_from_path(path) {
+                Some(item) => accepted.push(item),
+                None => invalid += 1,
+            }
+        }
+
+        if accepted.is_empty() {
+            if duplicated > 0 {
+                self.set_status("这些项目已经在面板里，未重复添加");
+            } else {
+                self.set_status("拖入的内容不是有效文件，未添加");
+            }
+            return;
+        }
+
+        let added = accepted.len();
+        for item in accepted {
+            self.config.groups[group_index].items.push(item);
+            desktop::place_item_in_group(&mut self.config.groups[group_index]);
+        }
+
+        if let Err(e) = self.config.save_result() {
+            // 落盘失败：把刚加进去的这批撤掉，避免内存与磁盘不一致
+            let len = self.config.groups[group_index].items.len();
+            self.config.groups[group_index]
+                .items
+                .truncate(len.saturating_sub(added));
+            self.set_status(format!("添加失败，已回滚：{}", e));
+            return;
+        }
+
+        self.prune_icons();
+        let mut status = format!("已添加 {} 项到「{}」", added, group_name);
+        if duplicated > 0 {
+            status.push_str(&format!("（{} 项已存在跳过）", duplicated));
+        }
+        if invalid > 0 {
+            status.push_str(&format!("（{} 项不是有效文件）", invalid));
+        }
+        self.set_status(status);
     }
 
     fn handle_tray_commands(&mut self, ctx: &egui::Context) {
@@ -308,9 +493,9 @@ impl DeskmanApp {
         }
     }
 
-    /// 获取（或提取并缓存）项目的真实图标纹理
+    /// 取真实图标纹理：命中缓存直接返回，未加载则交给后台线程并先画占位矢量图标
     fn icon_texture(&mut self, ctx: &egui::Context, item: &DesktopItem) -> Option<egui::TextureHandle> {
-        if !self.config.desktop.real_icons {
+        if !self.config.desktop.real_icons || item.path.is_empty() {
             return None;
         }
         match item.kind {
@@ -318,18 +503,7 @@ impl DeskmanApp {
             _ => {}
         }
         let key = item.path.to_lowercase();
-        if let Some(cached) = self.icon_textures.get(&key) {
-            return cached.clone();
-        }
-        let loaded = desktop::extract_icon_rgba(&item.path).and_then(|(rgba, w, h)| {
-            if w == 0 || h == 0 {
-                return None;
-            }
-            let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
-            Some(ctx.load_texture(format!("deskman_icon_{}", key), image, egui::TextureOptions::LINEAR))
-        });
-        self.icon_textures.insert(key, loaded.clone());
-        loaded
+        self.icons.texture(ctx, &key, &item.path)
     }
 
     /// 设置模式界面：普通窗口，只显示设置内容
@@ -389,6 +563,7 @@ impl eframe::App for DeskmanApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_started = Instant::now();
         if !self.style_initialized {
             setup_style(ctx);
             setup_chinese_fonts(ctx);
@@ -419,6 +594,9 @@ impl eframe::App for DeskmanApp {
 
         // 轮询系统桌面图标尺寸（约 3 秒一次）
         self.tick += 1;
+        if self.tick % 30 == 0 {
+            self.refresh_missing();
+        }
         if self.config.desktop.follow_system_icon_size && self.tick % 30 == 0 {
             self.system_icon_size = desktop_list::system_icon_size_logical();
             // 同步到各分组并按新尺寸重排网格（旧坐标是按旧尺寸算的）
@@ -440,6 +618,10 @@ impl eframe::App for DeskmanApp {
 
         self.sync_viewport(ctx);
         self.handle_tray_commands(ctx);
+        self.sync_live_watch();
+        self.handle_watcher();
+        // 限时消费后台提取完的图标，避免一帧里创建上百个纹理
+        let _ = self.icons.pump(ctx, Duration::from_millis(2));
 
         // "隐藏"只隐藏分类面板；工具条与 Dock 始终可用
         render_workspace(ctx, self);
@@ -477,6 +659,33 @@ impl eframe::App for DeskmanApp {
         update_click_through(ctx, self);
 
         draw_status_toast(ctx, self);
+
+        // 外部文件拖入：命中哪个分类面板就加到哪个分类
+        handle_file_drops(ctx, self);
+
+        let loaded = self.icons.pump(ctx, Duration::from_millis(3));
+        let _ = loaded;
+        if self.icons.len() > self.config.groups.iter().map(|g| g.items.len()).sum::<usize>() {
+            self.prune_icons();
+        }
+
+        // 帧耗时日志：只有超过 16ms 才记，且 2 秒内最多一条，便于判断是否掉帧
+        let cost = frame_started.elapsed();
+        if cost > Duration::from_millis(16)
+            && self
+                .last_perf_log
+                .map(|at| at.elapsed() >= Duration::from_secs(2))
+                .unwrap_or(true)
+        {
+            self.last_perf_log = Some(Instant::now());
+            eprintln!(
+                "[perf] 帧耗时 {:.1}ms（图标缓存 {}，缺图 {}）",
+                cost.as_secs_f64() * 1000.0,
+                self.icons.len(),
+                self.missing_paths.len()
+            );
+        }
+
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
@@ -498,6 +707,7 @@ impl Drop for DeskmanApp {
 
 fn render_workspace(ctx: &egui::Context, app: &mut DeskmanApp) {
     app.interactive_rects.clear();
+    app.group_rects.clear();
 
     egui::CentralPanel::default()
         .frame(Frame::new().fill(Color32::TRANSPARENT).inner_margin(0.0))
@@ -1062,6 +1272,21 @@ fn desktop_group(ctx: &egui::Context, app: &mut DeskmanApp, index: usize) {
                 app.config.groups[index].y = rect.min.y;
             }
             app.interactive_rects.push(response.rect);
+            app.group_rects.push((index, response.rect));
+
+            // 外部文件悬停在本分类上时描边高亮（drop_target 来自上一帧的命中测试）
+            if app.drop_target == Some(index) {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Tooltip,
+                    Id::new("deskman_drop_hint"),
+                ));
+                painter.rect_stroke(
+                    response.rect.expand(2.0),
+                    CornerRadius::same(radius.saturating_add(2)),
+                    Stroke::new(2.0, ACCENT),
+                    egui::StrokeKind::Outside,
+                );
+            }
         });
 }
 
@@ -1266,9 +1491,15 @@ fn icon_tile_list(
 ) {
     let icon_size = app.effective_icon_size(&app.config.groups[group_index]);
     let real_icon = app.icon_texture(ui.ctx(), item);
+    let missing = app.is_missing(item);
     let tile = Vec2::new(icon_size + 12.0, icon_size + 30.0);
     let (rect, response) = ui.allocate_exact_size(tile, Sense::click());
     let response = response.on_hover_cursor(CursorIcon::PointingHand);
+    let response = if missing {
+        response.on_hover_text("文件已不存在，右键可移除")
+    } else {
+        response
+    };
     paint_icon_tile(
         ui,
         rect,
@@ -1278,6 +1509,7 @@ fn icon_tile_list(
         real_icon.as_ref(),
         theme,
         app.config.desktop.show_labels,
+        missing,
     );
     if response.clicked() {
         match desktop::open_item(item) {
@@ -1349,7 +1581,7 @@ fn tile_context_menu(
             ui.close_menu();
         }
         ui.separator();
-        if ui.button("从面板移除").clicked() {
+        if ui.button("从面板移除（不再导入）").clicked() {
             remove_item_at(app, group_index, item_index);
             ui.close_menu();
         }
@@ -1371,6 +1603,7 @@ fn move_item_between_groups(app: &mut DeskmanApp, from: usize, item_index: usize
     app.config.groups[to].items.push(item);
     desktop::place_item_in_group(&mut app.config.groups[to]);
     app.save_config();
+    app.prune_icons();
     app.set_status(format!("已移动到「{}」", target_name));
 }
 
@@ -1381,8 +1614,13 @@ fn remove_item_at(app: &mut DeskmanApp, group_index: usize, item_index: usize) {
         return;
     }
     let item = app.config.groups[group_index].items.remove(item_index);
+    // 从面板移除的桌面文件写进忽略清单，之后扫描/实时同步都不再自动导入
+    if item.kind != DesktopItemKind::Command && !item.path.is_empty() {
+        desktop::add_ignored(&mut app.config, std::path::Path::new(&item.path));
+    }
     app.save_config();
-    app.set_status(format!("已移除「{}」", item.name));
+    app.prune_icons();
+    app.set_status(format!("已移除「{}」（之后不再自动导入）", item.name));
 }
 
 fn free_icon_canvas(
@@ -1430,6 +1668,7 @@ fn free_icon_canvas(
         .iter()
         .map(|it| app.icon_texture(ui.ctx(), it))
         .collect();
+    let missing_flags: Vec<bool> = items_snapshot.iter().map(|it| app.is_missing(it)).collect();
 
     {
         let group = &mut app.config.groups[group_index];
@@ -1452,6 +1691,13 @@ fn free_icon_canvas(
                 CursorIcon::Grab
             });
 
+            let missing = missing_flags.get(item_index).copied().unwrap_or(false);
+            let response = if missing {
+                response.on_hover_text("文件已不存在，右键可移除")
+            } else {
+                response
+            };
+
             paint_icon_tile(
                 ui,
                 rect,
@@ -1461,6 +1707,7 @@ fn free_icon_canvas(
                 textures.get(item_index).and_then(|t| t.as_ref()),
                 theme,
                 app.config.desktop.show_labels,
+                missing,
             );
 
             if response.clicked() {
@@ -1515,6 +1762,7 @@ fn paint_icon_tile(
     real_icon: Option<&egui::TextureHandle>,
     theme: &PanelTheme,
     show_labels: bool,
+    missing: bool,
 ) {
     let painter = ui.painter_at(rect.expand(30.0));
     let (_, kind_color) = desktop::item_badge(&item.kind);
@@ -1571,8 +1819,33 @@ fn paint_icon_tile(
         paint_kind_glyph(ui, badge_rect, &item.kind);
     }
 
+    if missing {
+        // 文件已不存在：压暗 + 虚线边 + 右上角「缺失」角标
+        painter.rect_filled(
+            badge_rect,
+            CornerRadius::same(badge_radius),
+            Color32::from_rgba_unmultiplied(12, 12, 16, 170),
+        );
+        painter.rect_stroke(
+            badge_rect,
+            CornerRadius::same(badge_radius),
+            Stroke::new(1.2, Color32::from_rgba_unmultiplied(243, 122, 131, 200)),
+            egui::StrokeKind::Inside,
+        );
+        let tag_font = FontId::proportional((badge_size * 0.18).clamp(9.0, 11.0));
+        painter.text(
+            badge_rect.center(),
+            Align2::CENTER_CENTER,
+            "缺失",
+            tag_font,
+            DANGER,
+        );
+    }
+
     if show_labels {
-        let label_color = if hovered {
+        let label_color = if missing {
+            DANGER
+        } else if hovered {
             theme.label_hover
         } else {
             theme.label
@@ -1878,6 +2151,31 @@ fn settings_window_body(ui: &mut egui::Ui, app: &mut DeskmanApp) {
             toggle_switch(ui, &mut app.config.scan.show_unclassified);
         });
     });
+    settings_row(ui, 40.0, |ui| {
+        row_texts(
+            ui,
+            "实时同步桌面",
+            "桌面新增文件约 1 秒内自动进入「未分类」",
+        );
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            toggle_switch(ui, &mut app.config.scan.live_sync);
+        });
+    });
+    settings_row(ui, 40.0, |ui| {
+        let count = app.config.scan.ignore.len();
+        row_texts(
+            ui,
+            "忽略清单",
+            &format!("已忽略 {} 项（从面板移除的桌面文件不会再被导入）", count),
+        );
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            if count > 0 && pill_button(ui, "清空", ButtonStyle::Ghost).clicked() {
+                app.config.scan.ignore.clear();
+                app.save_config();
+                app.set_status("已清空忽略清单，下次扫描会重新导入");
+            }
+        });
+    });
     settings_row(ui, 34.0, |ui| {
         if pill_button(ui, "立即扫描桌面", ButtonStyle::Primary).clicked() {
             app.scan_desktop();
@@ -1936,7 +2234,7 @@ fn settings_window_body(ui: &mut egui::Ui, app: &mut DeskmanApp) {
             let before = app.config.desktop.real_icons;
             toggle_switch(ui, &mut app.config.desktop.real_icons);
             if before && !app.config.desktop.real_icons {
-                app.icon_textures.clear();
+                app.icons.clear();
             }
         });
     });
@@ -2679,6 +2977,61 @@ fn update_click_through(ctx: &egui::Context, app: &mut DeskmanApp) {
     click_through::set_pass_through(!over_panel && !interacting);
 }
 
+/// 命中测试：返回指针所在的分类面板下标（重叠时取最上面一个，即列表靠后的）
+fn drop_target_at(pointer: Pos2, rects: &[(usize, Rect)]) -> Option<usize> {
+    rects
+        .iter()
+        .rev()
+        .find(|(_, rect)| rect.contains(pointer))
+        .map(|(index, _)| *index)
+}
+
+/// 处理从资源管理器拖入面板的文件：落到哪个分类面板就加到哪个分类
+fn handle_file_drops(ctx: &egui::Context, app: &mut DeskmanApp) {
+    let (hovered, dropped, pointer) = ctx.input(|i| {
+        (
+            !i.raw.hovered_files.is_empty(),
+            i.raw.dropped_files.clone(),
+            i.pointer.hover_pos(),
+        )
+    });
+    app.drop_target = if hovered || !dropped.is_empty() {
+        pointer.and_then(|p| drop_target_at(p, &app.group_rects))
+    } else {
+        None
+    };
+    if dropped.is_empty() {
+        return;
+    }
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut rejected = 0usize;
+    for file in dropped {
+        match file.path {
+            Some(path) => paths.push(path),
+            None => rejected += 1,
+        }
+    }
+    match app.drop_target {
+        Some(index) => {
+            if paths.is_empty() {
+                app.set_status("拖入的内容不是有效文件，未添加");
+            } else {
+                app.add_paths_to_group(index, &paths);
+                if rejected > 0 {
+                    app.set_status(format!("已添加 {} 项，{} 项不是本地文件被忽略", paths.len(), rejected));
+                }
+            }
+        }
+        None => {
+            if paths.is_empty() {
+                app.set_status("拖入的内容不是有效文件，未添加");
+            } else {
+                app.set_status("拖到某个分类面板上才能添加");
+            }
+        }
+    }
+}
+
 // ---------- 全局样式 ----------
 
 fn setup_style(ctx: &egui::Context) {
@@ -2729,4 +3082,45 @@ fn setup_chinese_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
+        Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h))
+    }
+
+    #[test]
+    fn drop_target_hits_inside_rect() {
+        let rects = vec![(0, rect(0.0, 0.0, 200.0, 100.0))];
+        assert_eq!(drop_target_at(Pos2::new(50.0, 50.0), &rects), Some(0));
+    }
+
+    #[test]
+    fn drop_target_misses_outside_all_rects() {
+        let rects = vec![
+            (0, rect(0.0, 0.0, 200.0, 100.0)),
+            (1, rect(300.0, 0.0, 200.0, 100.0)),
+        ];
+        assert_eq!(drop_target_at(Pos2::new(250.0, 50.0), &rects), None);
+        assert_eq!(drop_target_at(Pos2::new(-1.0, -1.0), &rects), None);
+    }
+
+    #[test]
+    fn drop_target_prefers_topmost_overlapping_group() {
+        // 后压入面板列表的分类绘制在上面，命中时也应优先
+        let rects = vec![
+            (0, rect(0.0, 0.0, 200.0, 100.0)),
+            (2, rect(100.0, 0.0, 200.0, 100.0)),
+        ];
+        assert_eq!(drop_target_at(Pos2::new(150.0, 50.0), &rects), Some(2));
+        assert_eq!(drop_target_at(Pos2::new(20.0, 50.0), &rects), Some(0));
+    }
+
+    #[test]
+    fn drop_target_on_empty_list_is_none() {
+        assert_eq!(drop_target_at(Pos2::new(10.0, 10.0), &[]), None);
+    }
 }
