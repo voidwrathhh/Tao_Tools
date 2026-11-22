@@ -14,14 +14,17 @@
 //   · 「结束」只针对本进程自己 spawn 的子进程 pid。
 
 use crate::config::HubConfig;
+use crate::health;
 use crate::launcher::{self, ResolveCache, RunningTools, Target};
+use crate::metadata::{self, WorkspacePackages};
 use crate::registry::{Problem, Registry, ToolEntry};
 use eframe::egui::{
     self, Align, Align2, Button, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText,
     ScrollArea, Sense, Stroke, TextEdit, Ui, Vec2,
 };
 use std::collections::HashSet;
-use std::time::Instant;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 // ─── 配色 ──────────────────────────────────────────────────
 
@@ -111,6 +114,18 @@ struct HubApp {
     resolve_cache: ResolveCache,
     /// 本进程拉起的子进程，用于「运行中」提示与「结束」
     processes: RunningTools,
+    /// 注册表校验 + 健康检查合并后的问题（展示用）
+    problems: Vec<Problem>,
+    /// 健康检查（版本 / 可执行文件）结果
+    health: Vec<Problem>,
+    /// `cargo metadata` 结果；None 表示还在后台读取或不可用
+    packages: Option<WorkspacePackages>,
+    /// 后台读取 `cargo metadata` 的通道
+    metadata_rx: Option<Receiver<Result<WorkspacePackages, String>>>,
+    /// 读取 `cargo metadata` 失败的原因（只提示）
+    metadata_error: Option<String>,
+    /// workspace 里存在但没注册到 registry.json 的包
+    unregistered: Vec<String>,
     filter: String,
     status: String,
     status_kind: StatusKind,
@@ -138,13 +153,22 @@ impl HubApp {
             tools,
             resolve_cache: ResolveCache::default(),
             processes: RunningTools::default(),
+            problems: Vec::new(),
+            health: Vec::new(),
+            packages: None,
+            metadata_rx: None,
+            metadata_error: None,
+            unregistered: Vec::new(),
             filter: String::new(),
             status: String::new(),
             status_kind: StatusKind::Info,
             status_at: None,
             style_initialized: false,
         };
-        app.announce_registry_state();
+        // 先做一轮同步体检（可执行文件 + 已知版本），cargo metadata 在后台补版本
+        app.refresh_health();
+        app.start_metadata_probe();
+        app.announce_state();
         app
     }
 
@@ -154,26 +178,95 @@ impl HubApp {
         self.tools = self.config.apply_order(&self.registry.tools);
         // config.paths / 注册表都可能变了，解析结果一律丢弃重算
         self.resolve_cache.clear();
+        // Cargo.toml 版本也可能变了：重新读一次 cargo metadata
+        self.start_metadata_probe();
 
         let count = self.tools.len();
-        if self.registry.problems.is_empty() {
+        if self.problems.is_empty() {
             self.set_status(format!("已刷新注册表，共 {} 个工具", count));
         } else {
-            let problems = self.registry.problems.len();
+            let problems = self.problems.len();
             self.set_warning(format!(
-                "已刷新注册表，共 {} 个工具；注册表有 {} 条问题（见列表顶部）",
+                "已刷新注册表，共 {} 个工具；体检有 {} 条问题（见列表顶部）",
                 count, problems
             ));
         }
     }
 
-    /// 启动时把注册表校验结果显示到状态栏（问题同时会在列表顶部与对应行标注）
-    fn announce_registry_state(&mut self) {
-        let Some(first) = self.registry.problems.first() else {
+    /// 重新计算健康检查（版本 + 可执行文件），并合并进展示用的问题列表
+    fn refresh_health(&mut self) {
+        self.health = health::collect(
+            &self.registry,
+            self.packages.as_ref(),
+            &self.config,
+            &mut self.resolve_cache,
+        );
+        self.rebuild_problems();
+    }
+
+    fn rebuild_problems(&mut self) {
+        let mut problems = self.registry.problems.clone();
+        problems.extend(self.health.iter().cloned());
+        if let Some(error) = &self.metadata_error {
+            problems.push(Problem::registry(format!(
+                "体检：无法读取 cargo metadata：{}（版本比对与未注册发现已跳过）",
+                error
+            )));
+        }
+        self.problems = problems;
+    }
+
+    /// 在后台线程跑 `cargo metadata`：秒级的启动开销不能卡住界面
+    fn start_metadata_probe(&mut self) {
+        self.metadata_rx = None;
+        self.packages = None;
+        self.metadata_error = None;
+        self.unregistered.clear();
+
+        let Some(manifest) = metadata::manifest_path() else {
+            self.metadata_error = Some("找不到 workspace 的 Cargo.toml".to_string());
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(metadata::run(&manifest));
+        });
+        self.metadata_rx = Some(receiver);
+    }
+
+    /// 每帧检查后台 metadata 是否返回；未返回时安排下一次重绘
+    fn poll_metadata(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.metadata_rx.take() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(packages)) => {
+                self.unregistered = health::unregistered(&self.registry, &packages);
+                self.packages = Some(packages);
+                self.refresh_health();
+            }
+            Ok(Err(error)) => {
+                self.metadata_error = Some(error);
+                self.refresh_health();
+            }
+            Err(TryRecvError::Empty) => {
+                self.metadata_rx = Some(receiver);
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.metadata_error = Some("后台读取线程意外退出".to_string());
+                self.refresh_health();
+            }
+        }
+    }
+
+    /// 启动时把体检结果显示到状态栏（问题同时会在列表顶部与对应行标注）
+    fn announce_state(&mut self) {
+        let Some(first) = self.problems.first() else {
             self.set_status("就绪：双击工具直接启动，右键可打开 README 或目录");
             return;
         };
-        let count = self.registry.problems.len();
+        let count = self.problems.len();
         let first = first.display();
         let more = if count > 1 {
             format!("（另有 {} 条）", count - 1)
@@ -181,7 +274,7 @@ impl HubApp {
             String::new()
         };
         self.set_warning(format!(
-            "注册表有 {} 条问题：{}{}；其余工具仍可启动",
+            "体检有 {} 条问题：{}{}；其余工具仍可启动",
             count, first, more
         ));
     }
@@ -214,11 +307,11 @@ impl HubApp {
 
     fn footer_hint(&self) -> String {
         let mut hint = String::from("↑ ↓ 调整顺序 · 顺序自动保存 · 右键条目打开 README / 目录");
-        if !self.registry.problems.is_empty() {
-            hint.push_str(&format!(
-                " · 注册表 {} 条问题（见列表顶部）",
-                self.registry.problems.len()
-            ));
+        if !self.problems.is_empty() {
+            hint.push_str(&format!(" · 体检 {} 条问题（见列表顶部）", self.problems.len()));
+        }
+        if !self.unregistered.is_empty() {
+            hint.push_str(&format!(" · {} 个包未注册", self.unregistered.len()));
         }
         // 调试构建下显示解析次数：300 帧后应恒等于工具数，可用来验证缓存生效
         if cfg!(debug_assertions) {
@@ -370,6 +463,9 @@ impl eframe::App for HubApp {
             self.style_initialized = true;
         }
 
+        // 后台 cargo metadata 返回后补齐版本比对与「未注册」列表
+        self.poll_metadata(ctx);
+
         self.header(ctx);
 
         let footer = self.footer_hint();
@@ -427,7 +523,8 @@ impl eframe::App for HubApp {
                 });
                 ui.add_space(10.0);
 
-                problems_banner(ui, &self.registry.problems);
+                problems_banner(ui, &self.problems);
+                unregistered_note(ui, &self.unregistered);
 
                 // 只收集可见行的下标，条目本身按引用取，不再每帧 clone
                 let visible: Vec<usize> = self
@@ -462,7 +559,7 @@ impl eframe::App for HubApp {
                             let row = RowCtx {
                                 tool,
                                 exe_hint: &exe_hint,
-                                problems: &self.registry.problems,
+                                problems: &self.problems,
                                 index,
                                 total: self.tools.len(),
                                 running: running.contains(&tool.id),
@@ -511,11 +608,11 @@ impl HubApp {
                             self.tools.len(),
                             self.registry.source.label()
                         );
-                        if !self.registry.problems.is_empty() {
-                            summary.push_str(&format!(
-                                " · {} 条问题",
-                                self.registry.problems.len()
-                            ));
+                        if !self.problems.is_empty() {
+                            summary.push_str(&format!(" · {} 条问题", self.problems.len()));
+                        }
+                        if !self.unregistered.is_empty() {
+                            summary.push_str(&format!(" · 未注册 {}", self.unregistered.len()));
                         }
                         ui.add(
                             egui::Label::new(RichText::new(summary).size(10.5).color(TEXT_FAINT))
@@ -526,6 +623,16 @@ impl HubApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.add(header_button("退出")).clicked() {
                             quit = true;
+                        }
+                        if !self.unregistered.is_empty() {
+                            let button = ui
+                                .add(header_button(&format!("未注册 {}", self.unregistered.len())))
+                                .on_hover_text(
+                                    "workspace 里有包还没写入 registry.json；点击打开「注册新工具」说明",
+                                );
+                            if button.clicked() {
+                                readme = true;
+                            }
                         }
                         if ui.add(header_button("说明")).clicked() {
                             readme = true;
@@ -745,7 +852,7 @@ fn tool_row(ui: &mut Ui, row: RowCtx<'_>) -> Option<Action> {
     action
 }
 
-/// 注册表问题横幅：顶部可读错误，软提示不阻塞其它工具
+/// 体检问题横幅：顶部可读错误，软提示不阻塞其它工具
 fn problems_banner(ui: &mut Ui, problems: &[Problem]) {
     if problems.is_empty() {
         return;
@@ -758,7 +865,7 @@ fn problems_banner(ui: &mut Ui, problems: &[Problem]) {
     frame.show(ui, |ui| {
         ui.label(
             RichText::new(format!(
-                "注册表校验发现 {} 条问题（软提示，不影响其它工具启动）",
+                "体检发现 {} 条问题（软提示，不影响其它工具启动）",
                 problems.len()
             ))
             .size(11.5)
@@ -779,13 +886,35 @@ fn problems_banner(ui: &mut Ui, problems: &[Problem]) {
         if problems.len() > 5 {
             ui.label(
                 RichText::new(format!(
-                    "…另有 {} 条，修正 registry.json 后点「刷新」重新校验",
+                    "…另有 {} 条，修正后点「刷新」重新体检",
                     problems.len() - 5
                 ))
                 .size(10.0)
                 .color(TEXT_FAINT),
             );
         }
+    });
+    ui.add_space(8.0);
+}
+
+/// 未注册 workspace 包提示：只列出，不自动写入注册表
+fn unregistered_note(ui: &mut Ui, unregistered: &[String]) {
+    if unregistered.is_empty() {
+        return;
+    }
+    let names = unregistered.join("、");
+    let frame = Frame::new()
+        .fill(Color32::from_rgb(24, 34, 44))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(46, 78, 112)))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(14, 10));
+    frame.show(ui, |ui| {
+        ui.label(
+            RichText::new(format!("{} 个包未注册：{}", unregistered.len(), names))
+                .size(11.0)
+                .color(ACCENT),
+        )
+        .on_hover_text("点右上角「未注册」打开 README 的「注册新工具」说明；toolhub 不会自动改写注册表");
     });
     ui.add_space(8.0);
 }

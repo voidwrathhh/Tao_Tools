@@ -95,14 +95,16 @@ pub struct Problem {
 }
 
 impl Problem {
-    fn registry(message: impl Into<String>) -> Self {
+    /// 注册表级问题（不对应某个具体工具）
+    pub fn registry(message: impl Into<String>) -> Self {
         Self {
             tool_id: None,
             message: message.into(),
         }
     }
 
-    fn tool(tool_id: Option<String>, message: impl Into<String>) -> Self {
+    /// 与某个工具相关的问题（`tool_id` 为 `None` 时退化为注册表级）
+    pub fn tool(tool_id: Option<String>, message: impl Into<String>) -> Self {
         Self {
             tool_id,
             message: message.into(),

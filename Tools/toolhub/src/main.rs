@@ -3,6 +3,7 @@
 // toolhub 是 tao_tools 工具中心的图形入口：
 //   toolhub              打开工具中心界面
 //   toolhub list         在终端列出已注册工具（含可执行文件解析结果）
+//   toolhub check        体检：版本不一致、可执行文件缺失、未注册的 workspace 包
 //   toolhub registry     打印当前生效的注册表路径
 //   toolhub open-registry 用系统编辑器打开注册表
 //
@@ -10,7 +11,9 @@
 
 mod config;
 mod gui;
+mod health;
 mod launcher;
+mod metadata;
 mod registry;
 
 use std::process;
@@ -23,6 +26,7 @@ fn main() {
     match args.get(1).map(|s| s.as_str()) {
         None | Some("gui") => gui::run(),
         Some("list") => list_tools(),
+        Some("check") => check_tools(),
         Some("registry") => {
             let registry = registry::Registry::load();
             warn_problems(&registry);
@@ -80,6 +84,59 @@ fn list_tools() {
     }
 }
 
+/// 体检：版本比对 + 可执行文件 + 未注册的 workspace 包
+///
+/// 只读、软提示：不修改注册表，也不因发现问题而返回非零退出码。
+fn check_tools() {
+    let registry = registry::Registry::load();
+    let config = config::HubConfig::load();
+    let packages = match metadata::manifest_path() {
+        Some(manifest) => match metadata::run(&manifest) {
+            Ok(packages) => Some(packages),
+            Err(e) => {
+                eprintln!("提示：{}（版本比对与未注册发现已跳过）", e);
+                None
+            }
+        },
+        None => {
+            eprintln!("提示：找不到 workspace 的 Cargo.toml（版本比对与未注册发现已跳过）");
+            None
+        }
+    };
+
+    let mut cache = launcher::ResolveCache::default();
+    let health = health::collect(&registry, packages.as_ref(), &config, &mut cache);
+    let total = registry.problems.len() + health.len();
+
+    println!("注册表：{}", registry.source.label());
+    println!(
+        "工具 {} 个 · 体检问题 {} 条（版本不一致 / 可执行文件）",
+        registry.tools.len(),
+        total
+    );
+    for problem in registry.problems.iter().chain(health.iter()) {
+        println!("  - {}", problem.display());
+    }
+
+    if let Some(packages) = &packages {
+        let unregistered = health::unregistered(&registry, packages);
+        if unregistered.is_empty() {
+            println!("未注册的 workspace 包：无");
+        } else {
+            println!(
+                "未注册的 workspace 包（{}）：{}",
+                unregistered.len(),
+                unregistered.join("、")
+            );
+            println!("  补登记见 toolhub/README.md「注册新工具」；toolhub 不会自动写入注册表。");
+        }
+    }
+
+    if total == 0 {
+        println!("体检通过：版本一致，可执行文件可解析");
+    }
+}
+
 /// 注册表校验问题打印到 stderr（保持 stdout 仍是可直接解析的表格）
 ///
 /// 与 GUI 一致：只做软提示，不影响其它工具的使用，也不把退出码改成失败。
@@ -99,6 +156,7 @@ fn print_usage() {
     println!("用法：");
     println!("  {}                              打开工具中心界面", APP_NAME);
     println!("  {} list                         列出已注册工具", APP_NAME);
+    println!("  {} check                        体检：版本 / 可执行文件 / 未注册包", APP_NAME);
     println!("  {} registry                     显示当前生效的注册表", APP_NAME);
     println!("  {} open-registry                打开注册表文件", APP_NAME);
     println!("  {} --version, -v                显示版本", APP_NAME);

@@ -118,6 +118,41 @@ pub struct Launched {
     pub child: Child,
 }
 
+/// 构造启动命令（纯逻辑，便于单测参数是否逐个传递）
+///
+/// 参数一律经 `Command::args` 逐个传入，不再拼成一行交给 `cmd /K`：
+/// 含 `&` `|` `^` `%VAR%`、空格、引号或中文的参数都会原样到达子进程。
+/// 代价是控制台工具退出后窗口随进程关闭（不再用 `cmd /K` 保留现场）。
+fn build_command(target: &Target, tool: &ToolEntry, args: &[String]) -> Command {
+    match target {
+        Target::Exe(path) => {
+            let mut command = Command::new(path);
+            command.args(args);
+            if tool.console {
+                attach_console(&mut command);
+            }
+            command
+        }
+        Target::CargoRun(root) => {
+            // 直接调用 cargo：`cmd /C start` 会把参数交给 cmd 二次解释，同样有注入风险
+            let mut command = Command::new("cargo");
+            command.current_dir(root);
+            command
+                .arg("run")
+                .arg("-p")
+                .arg(&tool.id)
+                .arg("--")
+                .args(args);
+            if tool.console {
+                attach_console(&mut command);
+            } else {
+                detach_window(&mut command);
+            }
+            command
+        }
+    }
+}
+
 pub fn launch(tool: &ToolEntry, args: &[String], config: &HubConfig) -> Result<Launched, String> {
     let target = resolve(tool, config).ok_or_else(|| {
         format!(
@@ -125,59 +160,23 @@ pub fn launch(tool: &ToolEntry, args: &[String], config: &HubConfig) -> Result<L
             tool.id, tool.id
         )
     })?;
+    let message = match &target {
+        Target::Exe(path) => format!("已启动 {}（{}）", tool.id, path.display()),
+        Target::CargoRun(_) => format!(
+            "正在通过 cargo run 启动 {}（首次编译可能较慢）",
+            tool.id
+        ),
+    };
 
-    match target {
-        Target::Exe(path) => {
-            let mut command = if tool.console {
-                // 控制台工具用 cmd /K 包一层：工具退出后窗口保留，输出不会一闪而过
-                let mut line = quote_arg(&path.display().to_string());
-                for arg in args {
-                    line.push(' ');
-                    line.push_str(&quote_arg(arg));
-                }
-                let mut command = Command::new("cmd");
-                command.arg("/K").arg(line);
-                attach_console(&mut command);
-                command
-            } else {
-                let mut command = Command::new(&path);
-                command.args(args);
-                command
-            };
-            let child = command
-                .spawn()
-                .map_err(|e| format!("启动 {} 失败：{}", path.display(), e))?;
-            Ok(Launched {
-                message: format!("已启动 {}（{}）", tool.id, path.display()),
-                child,
-            })
-        }
-        Target::CargoRun(root) => {
-            let mut command = Command::new("cmd");
-            command
-                .current_dir(&root)
-                .arg("/C")
-                .arg("start")
-                .arg("")
-                .arg("cargo")
-                .arg("run")
-                .arg("-p")
-                .arg(&tool.id)
-                .arg("--")
-                .args(args);
-            detach_window(&mut command);
-            let child = command
-                .spawn()
-                .map_err(|e| format!("启动 cargo run -p {} 失败：{}", tool.id, e))?;
-            Ok(Launched {
-                message: format!(
-                    "正在通过 cargo run 启动 {}（首次编译可能较慢）",
-                    tool.id
-                ),
-                child,
-            })
-        }
-    }
+    let mut command = build_command(&target, tool, args);
+    let child = command.spawn().map_err(|e| match &target {
+        Target::Exe(path) => format!("启动 {} 失败：{}", path.display(), e),
+        Target::CargoRun(_) => format!(
+            "启动 cargo run -p {} 失败：{}（cargo 不在 PATH 中？可先 cargo build 或 cargo install）",
+            tool.id, e
+        ),
+    })?;
+    Ok(Launched { message, child })
 }
 
 /// 本进程拉起、尚未确认退出的子进程
@@ -268,18 +267,6 @@ pub fn open_folder(path: &Path) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("打开目录 {} 失败：{}", path.display(), e))?;
     Ok(())
-}
-
-/// 给 cmd 的命令行片段加引号（路径或参数含空格时必需）
-fn quote_arg(value: &str) -> String {
-    if value.is_empty() {
-        return "\"\"".to_string();
-    }
-    if value.contains([' ', '\t', '"']) {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    } else {
-        value.to_string()
-    }
 }
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
@@ -377,5 +364,67 @@ mod tests {
         assert!(running.poll_running().is_empty());
         assert_eq!(running.running_pid("anything"), None);
         assert_eq!(running.stop("anything"), Ok(None));
+    }
+
+    fn command_args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// 含 & | ^ %VAR%、空格、引号、中文的参数必须逐个原样传给子进程
+    #[test]
+    fn exe_arguments_are_passed_verbatim() {
+        let tool = fixture_tool("echoargs");
+        let exe = r"C:\Program Files\Tao 工具\echoargs.exe";
+        let target = Target::Exe(PathBuf::from(exe));
+        let args = vec![
+            "a&b".to_string(),
+            "c d".to_string(),
+            "e\"f".to_string(),
+            "中文 路径".to_string(),
+            "%PATH%".to_string(),
+            "x|y".to_string(),
+            "^caret".to_string(),
+            String::new(),
+        ];
+
+        let command = build_command(&target, &tool, &args);
+        // 程序就是 exe 本身，没有经过 cmd /K 包一层
+        assert_eq!(command.get_program(), std::ffi::OsStr::new(exe));
+        assert_eq!(command_args(&command), args);
+    }
+
+    /// 控制台工具仍带 CREATE_NEW_CONSOLE，但不再拼 cmd 命令行
+    #[test]
+    fn console_tool_is_not_wrapped_in_cmd() {
+        let mut tool = fixture_tool("sertool");
+        tool.console = true;
+        let target = Target::Exe(PathBuf::from(r"D:\Tools\sertool.exe"));
+        let args = vec!["--port".to_string(), "COM3 & echo pwned".to_string()];
+
+        let command = build_command(&target, &tool, &args);
+        assert_eq!(
+            command.get_program(),
+            std::ffi::OsStr::new(r"D:\Tools\sertool.exe")
+        );
+        assert_eq!(command_args(&command), args);
+    }
+
+    /// cargo run 回退分支同样逐个传参
+    #[test]
+    fn cargo_run_arguments_are_passed_verbatim() {
+        let mut tool = fixture_tool("friend");
+        tool.console = true;
+        let target = Target::CargoRun(PathBuf::from(r"D:\File_Data\Tao_Tools\Tools"));
+        let args = vec!["a&b".to_string(), "c d".to_string(), "中文".to_string()];
+
+        let command = build_command(&target, &tool, &args);
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("cargo"));
+        assert_eq!(
+            command_args(&command),
+            vec!["run", "-p", "friend", "--", "a&b", "c d", "中文"]
+        );
     }
 }
