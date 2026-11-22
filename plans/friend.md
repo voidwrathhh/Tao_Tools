@@ -1,6 +1,6 @@
 # friend 开发计划
 
-> 状态：进行中　最后更新：2026-11-22　版本基线：v1.0.1
+> 状态：进行中　最后更新：2026-11-22　版本基线：v1.1.0
 
 ## 1. 目标
 
@@ -13,20 +13,6 @@
 - **不托管密钥**：API Key 只从 `~/.tao_tools/friend/config.toml` 读，不写进代码、不落库、不提交仓库。
 
 ## 3. 候选功能
-
-### P1 配置缺省值与启动校验
-
-- 证据：`Config`/`ApiConfig`/`PersonalityConfig`/`ChatConfig`（`main.rs:19-44`）全字段必填、无 `#[serde(default)]`；`main.rs:192-197` 解析失败只打一行 toml 报错就退出；`key` 为空仍带 `Bearer ` 发请求，直到 401 才暴露。
-- 做法：给 `greeting`/`temperature`/`auto_save`/`max_context` 等加 `#[serde(default = "...")]`；解析失败提示具体缺失项；启动前校验 key 非空、endpoint 以 `http(s)://` 开头；配置写入改「临时文件 + 原子替换」。
-- 验收：删掉 `[chat]` 整段仍能启动并落默认值；key 为空时首条消息发出前就提示；写坏配置后退出码 1 且原文件字节不变。
-- 版本：patch（v1.0.2）
-
-### P1 流式请求超时、可中断、SSE 容错
-
-- 证据：`main.rs:615` 直接 `ureq::post` 无 Agent 级 timeout；`main.rs:650-676` 只取 `choices[0].delta.content`，丢弃 `reasoning_content`/`finish_reason`，只匹配 `"data: "`（带空格）；首行不匹配就报「未知的响应格式」（`main.rs:699`）；流中 Ctrl+C 直接杀进程，半截回复不落盘。
-- 做法：复用 `ureq::AgentBuilder`，`timeout_connect(10s)` / `timeout_read(60s)`；SSE 解析跳过空行与 `:` 注释、`data:` 后空格可选；`reasoning_content` 用暗色单独输出；Ctrl+C 置 `AtomicBool` 收尾保存（引入 `ctrlc` 需同意）。
-- 验收：endpoint 指向只连不回的端口，60s 内给中文超时提示；`data:{...}`（无空格）可解析；流中 Ctrl+C 后 `--continue` 能看到已收部分。
-- 版本：minor（v1.1.0）
 
 ### P2 支持非 OpenAI 格式 API（Anthropic）
 
@@ -50,8 +36,6 @@
 
 | 版本 | 内容 |
 |---|---|
-| v1.0.2 | P1 配置缺省与校验 |
-| v1.1.0 | P1 流式超时/中断/SSE 容错 |
 | v1.2.0 | P2 Anthropic API |
 | v1.3.0 | P2 对话导出 / 多人格 |
 | v1.4.0 | P2 训练参数细化 |
@@ -62,3 +46,4 @@
 - 训练反馈靠系统提示词拼装，条数增多会挤占上下文（现 `max_context = 30`），导出与多人格都不能放大 prompt。
 - `#[serde(default)]` 会让"字段名写错"从报错变成静默用默认值，需权衡是否保留严格模式。
 - 中断保存要处理：只保存已完整收到的内容，半截 JSON 行不能写进历史。
+- 同步 HTTP 下 Ctrl+C 无法打断阻塞中的 socket 读：服务端长时间不吐数据时，中断最多延迟到下一块数据或 60 秒读取超时（已写进 README「交互说明」）；若将来要求「任意时刻立即中断」，需要把读循环挪到独立线程 + 通道，或用 non-blocking 轮询，代价是改动流式主路径。

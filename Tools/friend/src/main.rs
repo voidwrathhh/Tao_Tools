@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -13,35 +14,94 @@ const CONFIG_FILE: &str = "config.toml";
 const CONV_DIR: &str = "conversations";
 const TRAINING_FILE: &str = "training.json";
 
+/// 建立连接的超时（秒）：只连不回的端口最多等这么久
+const CONNECT_TIMEOUT_SECS: u64 = 10;
+/// 单次读取的超时（秒）：流式输出时超过这么久没有新数据就报超时
+const READ_TIMEOUT_SECS: u64 = 60;
+
+const DEFAULT_MODEL: &str = "gpt-4o-mini";
+const DEFAULT_TEMPERATURE: f64 = 0.8;
+const DEFAULT_MAX_CONTEXT: usize = 30;
+
 // ======================== 数据结构 ========================
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct Config {
     api: ApiConfig,
+    /// 整段 [personality] 缺失时用内置默认人格，不报错
+    #[serde(default)]
     personality: PersonalityConfig,
+    /// 整段 [chat] 缺失时用默认值（auto_save = true、max_context = 30）
+    #[serde(default)]
     chat: ChatConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct ApiConfig {
     endpoint: String,
+    /// 留空也能解析成功，启动校验时给中文提示（而不是等到 401）
+    #[serde(default)]
     key: String,
+    #[serde(default = "default_model")]
     model: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct PersonalityConfig {
     name: String,
+    /// 可留空：留空就不打印开场白
+    #[serde(default)]
     greeting: String,
+    #[serde(default = "default_system_prompt")]
     system_prompt: String,
+    #[serde(default = "default_temperature")]
     temperature: f64,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct ChatConfig {
+    #[serde(default = "default_auto_save")]
     auto_save: bool,
+    #[serde(default = "default_max_context")]
     max_context: usize,
 }
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        ChatConfig {
+            auto_save: default_auto_save(),
+            max_context: default_max_context(),
+        }
+    }
+}
+
+impl Default for PersonalityConfig {
+    fn default() -> Self {
+        PersonalityConfig {
+            name: "朋友".to_string(),
+            greeting: String::new(),
+            system_prompt: default_system_prompt(),
+            temperature: default_temperature(),
+        }
+    }
+}
+
+fn default_model() -> String {
+    DEFAULT_MODEL.to_string()
+}
+
+fn default_temperature() -> f64 {
+    DEFAULT_TEMPERATURE
+}
+
+fn default_auto_save() -> bool {
+    true
+}
+
+fn default_max_context() -> usize {
+    DEFAULT_MAX_CONTEXT
+}
+
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct Message {
@@ -138,13 +198,25 @@ fn default_personality(name: &str) -> Option<Config> {
                 ).to_string(),
                 temperature: 0.7,
             },
-            chat: ChatConfig {
-                auto_save: true,
-                max_context: 30,
-            },
+            chat: ChatConfig::default(),
         }),
         _ => None,
     }
+}
+
+/// 默认人格的系统提示词（内置人格与「[personality] 整段缺失」共用）
+fn default_system_prompt() -> String {
+    concat!(
+        "你是一个温暖、真诚的 AI 朋友。\n",
+        "说话自然亲切，像认识很久的朋友一样。\n",
+        "1. 用口语化的方式交流，适当使用语气词\n",
+        "2. 关心用户的感受，主动倾听\n",
+        "3. 有自己的「性格」——会开玩笑、会表达观点\n",
+        "4. 记住对话中提到的细节，在后续话题中提及\n",
+        "5. 不知道的事情坦诚说不知道\n",
+        "6. 回复简洁自然，不啰嗦\n",
+    )
+    .to_string()
 }
 
 fn default_config() -> Config {
@@ -152,28 +224,15 @@ fn default_config() -> Config {
         api: ApiConfig {
             endpoint: "https://api.openai.com/v1/chat/completions".to_string(),
             key: "".to_string(),
-            model: "gpt-4o-mini".to_string(),
+            model: DEFAULT_MODEL.to_string(),
         },
         personality: PersonalityConfig {
             name: "朋友".to_string(),
             greeting: "你好！我是你的 AI 朋友，很高兴认识你！(´▽`ʃ♡ƪ)".to_string(),
-            system_prompt: concat!(
-                "你是一个温暖、真诚的 AI 朋友。\n",
-                "说话自然亲切，像认识很久的朋友一样。\n",
-                "1. 用口语化的方式交流，适当使用语气词\n",
-                "2. 关心用户的感受，主动倾听\n",
-                "3. 有自己的「性格」——会开玩笑、会表达观点\n",
-                "4. 记住对话中提到的细节，在后续话题中提及\n",
-                "5. 不知道的事情坦诚说不知道\n",
-                "6. 回复简洁自然，不啰嗦\n",
-            )
-            .to_string(),
-            temperature: 0.8,
+            system_prompt: default_system_prompt(),
+            temperature: DEFAULT_TEMPERATURE,
         },
-        chat: ChatConfig {
-            auto_save: true,
-            max_context: 30,
-        },
+        chat: ChatConfig::default(),
     }
 }
 
@@ -189,11 +248,16 @@ fn load_config(persona: Option<&str>) -> Config {
             eprintln!("错误: 读取配置文件失败 - {}", e);
             process::exit(1);
         });
-        return toml::from_str(&content).unwrap_or_else(|e| {
-            eprintln!("错误: 配置文件解析失败 - {}", e);
-            eprintln!("请检查 {} 格式是否正确", path.display());
-            process::exit(1);
-        });
+        return match toml::from_str::<Config>(&content) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("{} 配置文件解析失败", ansi("error", "错误:"));
+                for line in format_config_error(&content, &e, &path) {
+                    eprintln!("{}", line);
+                }
+                process::exit(1);
+            }
+        };
     }
 
     // 不存在 → 尝试创建
@@ -212,7 +276,7 @@ fn load_config(persona: Option<&str>) -> Config {
         eprintln!("错误: 序列化配置失败 - {}", e);
         process::exit(1);
     });
-    fs::write(&path, toml_str).unwrap_or_else(|e| {
+    write_atomic(&path, &toml_str).unwrap_or_else(|e| {
         eprintln!("错误: 无法写入配置文件 {} - {}", path.display(), e);
         process::exit(1);
     });
@@ -236,6 +300,134 @@ fn load_config(persona: Option<&str>) -> Config {
         }
     }
     process::exit(0);
+}
+
+/// 本次要用的配置文件路径（带角色时是 config-<角色>.toml）
+fn config_file_for(persona: Option<&str>) -> PathBuf {
+    match persona {
+        Some(name) => personality_config_path(name),
+        None => config_path(),
+    }
+}
+
+/// 临时文件名：config.toml.tmp（与目标同目录，改名是原子的）
+fn tmp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| CONFIG_FILE.to_string());
+    path.with_file_name(format!("{}.tmp", name))
+}
+
+/// 「临时文件 + 改名替换」：写一半崩掉也不会把原配置写成半截内容
+fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
+    let tmp = tmp_path(path);
+    fs::write(&tmp, content)?;
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// 字节偏移 → (行号, 列号)，都从 1 开始
+fn line_col(content: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(content.len());
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for (i, ch) in content.char_indices() {
+        if i >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+/// 把 toml 解析错误整理成能直接看懂的几行：错在第几行、缺哪个字段
+fn format_config_error(content: &str, err: &toml::de::Error, path: &Path) -> Vec<String> {
+    let mut out = vec![format!("  原因: {}", err.message())];
+    if let Some(span) = err.span() {
+        let (line_no, col) = line_col(content, span.start);
+        out.push(format!(
+            "  位置: {} 第 {} 行第 {} 列",
+            path.display(),
+            line_no,
+            col
+        ));
+        if let Some(text) = content.lines().nth(line_no - 1) {
+            out.push(format!("  > {}", text.trim_end()));
+        }
+    }
+    if err.message().contains("missing field") {
+        out.push("  （字段缺失：缺哪个 section/字段就补哪一行；字段名拼错也会报 missing field）".to_string());
+    }
+    out.push("  编辑配置: friend --edit-config".to_string());
+    out
+}
+
+/// 启动前的配置校验：返回所有问题（空表示可以聊）
+fn config_problems(config: &Config) -> Vec<String> {
+    let mut problems = Vec::new();
+
+    if config.api.key.trim().is_empty() {
+        problems.push(
+            "[api] key 为空：填入 API 密钥，否则首个请求只会拿到 401".to_string(),
+        );
+    }
+
+    let endpoint = config.api.endpoint.trim();
+    if endpoint.is_empty() {
+        problems.push(
+            "[api] endpoint 为空：填完整地址，如 https://api.deepseek.com/v1/chat/completions"
+                .to_string(),
+        );
+    } else if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+        problems.push(format!(
+            "[api] endpoint 必须以 http:// 或 https:// 开头，当前是「{}」",
+            endpoint
+        ));
+    }
+
+    if config.api.model.trim().is_empty() {
+        problems.push("[api] model 为空：填模型名，如 deepseek-chat".to_string());
+    }
+
+    let temperature = config.personality.temperature;
+    if !(0.0..=2.0).contains(&temperature) {
+        problems.push(format!(
+            "[personality] temperature 应在 0.0-2.0 之间，当前是 {}",
+            temperature
+        ));
+    }
+
+    if config.chat.max_context == 0 {
+        problems.push("[chat] max_context 至少为 1".to_string());
+    }
+
+    problems
+}
+
+/// 有问题就在发出第一条消息之前拦住（而不是等 401 / 超时）
+fn ensure_config_ready(config: &Config, path: &Path) {
+    let problems = config_problems(config);
+    if problems.is_empty() {
+        return;
+    }
+    eprintln!("{} 配置不完整，先改配置再聊：", ansi("error", "错误:"));
+    for problem in &problems {
+        eprintln!("  - {}", problem);
+    }
+    eprintln!("  配置文件: {}", path.display());
+    eprintln!("  编辑配置: friend --edit-config");
+    process::exit(1);
 }
 
 // ======================== 对话管理 ========================
@@ -508,6 +700,60 @@ fn compose_system_prompt(base: &str, examples: &[TrainingExample]) -> String {
     prompt
 }
 
+// ======================== 中断处理（Ctrl+C） ========================
+
+/// 只在「等待流式响应」期间接管 Ctrl+C：置位后由流式循环收尾保存；
+/// 其余时刻不接管，Ctrl+C 保持系统默认（直接退出）。
+#[cfg(windows)]
+mod interrupt {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(
+            handler: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
+    }
+
+    unsafe extern "system" fn handler(_ctrl_type: u32) -> i32 {
+        // 返回 1 = 已处理，进程不退出；由流式循环看到标志后收尾
+        INTERRUPTED.store(true, Ordering::SeqCst);
+        1
+    }
+
+    pub fn install() {
+        unsafe {
+            // 以 CREATE_NEW_PROCESS_GROUP 拉起的进程（start / 计划任务 / 脚本）默认忽略 Ctrl+C，
+            // 先恢复常规处理，否则自定义 handler 根本收不到事件
+            SetConsoleCtrlHandler(None, 0);
+            SetConsoleCtrlHandler(Some(handler), 1);
+        }
+    }
+
+    pub fn uninstall() {
+        unsafe {
+            SetConsoleCtrlHandler(Some(handler), 0);
+        }
+    }
+
+    /// 读取并清空标志
+    pub fn take() -> bool {
+        INTERRUPTED.swap(false, Ordering::SeqCst)
+    }
+}
+
+#[cfg(not(windows))]
+mod interrupt {
+    pub fn install() {}
+    pub fn uninstall() {}
+    pub fn take() -> bool {
+        false
+    }
+}
+
 // ======================== 终端样式 ========================
 
 /// 根据角色名返回 AI 发言的颜色标签
@@ -541,6 +787,8 @@ fn ansi(tag: &str, text: &str) -> String {
         "system" => format!("\x1b[33m{}\x1b[0m", text),
         "error" => format!("\x1b[31m{}\x1b[0m", text),
         "highlight" => format!("\x1b[35m{}\x1b[0m", text),
+        // reasoning_content 用暗灰，和正文区分开
+        "thinking" => format!("\x1b[90m{}\x1b[0m", text),
         "violet" => format!("\x1b[38;5;219m{}\x1b[0m", text),
         "violet_dim" => format!("\x1b[38;5;141m{}\x1b[0m", text),
         _ => text.to_string(),
@@ -594,6 +842,11 @@ fn print_help() {
         "纠正上一条 AI 回复，记录训练数据"
     );
     println!("  {:<20} {}", ansi("highlight", "/help"), "显示帮助");
+    println!(
+        "  {:<20} {}",
+        ansi("highlight", "Ctrl+C"),
+        "AI 回复中按下：中断本次回复，已收到的内容会保存"
+    );
     println!();
 }
 
@@ -608,12 +861,206 @@ fn build_request_body(config: &Config, messages: &[Message]) -> serde_json::Valu
     })
 }
 
-fn send_chat(config: &Config, messages: &[Message]) -> Result<String, String> {
+/// 单次回复的结果：正文 + 推理内容（reasoning_content）+ 是否被 Ctrl+C 中断
+#[derive(Debug, Default, PartialEq)]
+struct StreamOutcome {
+    content: String,
+    reasoning: String,
+    interrupted: bool,
+}
+
+fn chat_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .timeout_read(Duration::from_secs(READ_TIMEOUT_SECS))
+        .build()
+}
+
+/// ureq / 系统错误里的超时判定（英文/中文/常见 socket 错误码都判）
+fn looks_like_timeout(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("timed out")
+        || lower.contains("timeout")
+        || msg.contains("超时")
+        || msg.contains("10060")
+        || msg.contains("没有正确答复")
+        || msg.contains("没有响应")
+}
+
+/// 去掉 ureq 层层包裹的 `Network Error: ` 前缀，只留真正的原因
+fn clean_transport_error(raw: &str) -> String {
+    let mut rest = raw.trim();
+    while let Some(stripped) = rest.strip_prefix("Network Error: ") {
+        rest = stripped.trim_start();
+    }
+    rest.to_string()
+}
+
+/// 从错误文本里抠出 `os error N` 的码值，用于给出简短提示
+fn os_error_code(msg: &str) -> Option<String> {
+    let idx = msg.find("os error ")?;
+    let digits: String = msg[idx + "os error ".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(digits)
+    }
+}
+
+/// 解析一行 SSE：空行、`:` 开头的注释、`event:`/`id:`/`retry:` 等非 data 字段都返回 None；
+/// `data:` 后面的空格可有可无（兼容 `data:{...}` 与 `data: {...}`）
+fn sse_data(line: &str) -> Option<&str> {
+    let trimmed = line.trim_end_matches(['\r', '\n']).trim_start();
+    if trimmed.is_empty() || trimmed.starts_with(':') {
+        return None;
+    }
+    let rest = trimmed.strip_prefix("data:")?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
+fn read_error(e: io::Error) -> String {
+    let msg = e.to_string();
+    if e.kind() == io::ErrorKind::TimedOut
+        || e.kind() == io::ErrorKind::WouldBlock
+        || looks_like_timeout(&msg)
+    {
+        format!("读取响应超时（{} 秒没有新数据）：{}", READ_TIMEOUT_SECS, msg)
+    } else {
+        format!("读取响应失败: {}", msg)
+    }
+}
+
+/// 跳过空行与注释，拿到第一行有内容的数据
+fn read_first_payload<R: BufRead>(reader: &mut R) -> Result<String, String> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).map_err(read_error)? == 0 {
+            return Err("服务端没有返回任何内容".to_string());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with(':') {
+            continue;
+        }
+        return Ok(line.clone());
+    }
+}
+
+/// 非流式（一次性 JSON）响应
+fn read_plain_json<R: BufRead>(reader: &mut R, first: String) -> Result<StreamOutcome, String> {
+    let mut json_str = first;
+    let mut line = String::new();
+    while reader.read_line(&mut line).map_err(read_error)? > 0 {
+        json_str.push_str(&line);
+        line.clear();
+    }
+    let resp: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|e| format!("解析响应失败: {}", e))?;
+    let content = resp
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    println!("{}", content);
+    Ok(StreamOutcome {
+        content,
+        ..Default::default()
+    })
+}
+
+/// 逐行消费 SSE：
+/// - 跳过空行、`:` 注释、`event:` 等非 data 字段（不再「首行不是 data: 就报未知格式」）
+/// - `data:` 后空格可选，`data: [DONE]` 与 `finish_reason` 都作为结束信号
+/// - 坏 JSON 单块跳过，不中断整段回复
+/// - 每次读下一行前调用 `stop_requested()`，为 true 就中断并保留已收到的内容
+fn stream_sse<R, S, C, T>(
+    reader: &mut R,
+    first_line: &str,
+    mut stop_requested: S,
+    mut emit_content: C,
+    mut emit_reasoning: T,
+) -> Result<StreamOutcome, String>
+where
+    R: BufRead,
+    S: FnMut() -> bool,
+    C: FnMut(&str),
+    T: FnMut(&str),
+{
+    let mut outcome = StreamOutcome::default();
+    let mut line = first_line.to_string();
+    let mut finished = false;
+
+    loop {
+        if stop_requested() {
+            outcome.interrupted = true;
+            break;
+        }
+
+        if let Some(data) = sse_data(&line) {
+            let data = data.trim();
+            if data == "[DONE]" {
+                finished = true;
+            } else if !data.is_empty() {
+                if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(choice) = chunk.get("choices").and_then(|c| c.get(0)) {
+                        if let Some(reasoning) = choice
+                            .get("delta")
+                            .and_then(|d| d.get("reasoning_content"))
+                            .and_then(|r| r.as_str())
+                        {
+                            if !reasoning.is_empty() {
+                                outcome.reasoning.push_str(reasoning);
+                                emit_reasoning(reasoning);
+                            }
+                        }
+                        if let Some(content) = choice
+                            .get("delta")
+                            .and_then(|d| d.get("content"))
+                            .and_then(|c| c.as_str())
+                        {
+                            if !content.is_empty() {
+                                outcome.content.push_str(content);
+                                emit_content(content);
+                            }
+                        }
+                        if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+                            if !finish.is_empty() {
+                                finished = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if finished {
+            break;
+        }
+
+        line.clear();
+        if reader.read_line(&mut line).map_err(read_error)? == 0 {
+            break;
+        }
+    }
+
+    Ok(outcome)
+}
+
+fn send_chat(config: &Config, messages: &[Message]) -> Result<StreamOutcome, String> {
     let url = config.api.endpoint.trim_end_matches('/').to_string();
     let body = build_request_body(config, messages);
+    let agent = chat_agent();
 
-    let response = match ureq::post(&url)
+    let response = match agent
+        .post(&url)
         .set("Authorization", &format!("Bearer {}", config.api.key))
+        .set("Accept", "text/event-stream")
         .set("Content-Type", "application/json")
         .send_json(&body)
     {
@@ -631,73 +1078,52 @@ fn send_chat(config: &Config, messages: &[Message]) -> Result<String, String> {
             };
             return Err(format!("API 返回错误 ({}): {}", code, err_msg));
         }
-        Err(e) => return Err(format!("API 请求失败: {}", e)),
+        Err(e) => {
+            let detail = clean_transport_error(&e.to_string());
+            if looks_like_timeout(&detail) {
+                let code = os_error_code(&detail)
+                    .map(|c| format!("，os error {}", c))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "请求超时（连接 {} 秒 / 读取 {} 秒）：服务器没有及时响应，检查 endpoint 或网络{}",
+                    CONNECT_TIMEOUT_SECS, READ_TIMEOUT_SECS, code
+                ));
+            }
+            return Err(format!("API 请求失败: {}", detail));
+        }
     };
 
-    let reader = response.into_reader();
-    let mut buf_reader = BufReader::new(reader);
-    let mut first_line = String::new();
+    let mut reader = BufReader::new(response.into_reader());
+    let first_line = read_first_payload(&mut reader)?;
 
-    buf_reader
-        .read_line(&mut first_line)
-        .map_err(|e| format!("读取响应失败: {}", e))?;
-    let first_line = first_line.trim().to_string();
-
-    if first_line.starts_with("data: ") {
-        // SSE 流式响应
-        let mut full = String::new();
-        let mut current_line = first_line;
-
-        loop {
-            let trimmed = current_line.trim();
-            if trimmed.starts_with("data: ") {
-                let data = &trimmed[6..];
-                if data == "[DONE]" || data.is_empty() {
-                    break;
-                }
-                if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
-                    if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
-                        full.push_str(content);
-                        print!("{}", content);
-                        io::stdout().flush().ok();
-                    }
-                }
-            }
-            current_line.clear();
-            if buf_reader
-                .read_line(&mut current_line)
-                .map_err(|e| format!("读取响应失败: {}", e))?
-                == 0
-            {
-                break;
-            }
-        }
-
-        println!();
-        Ok(full)
-    } else if first_line.starts_with('{') {
-        // 非流式 JSON 响应
-        let mut json_str = first_line;
-        let mut line = String::new();
-        while buf_reader
-            .read_line(&mut line)
-            .map_err(|e| format!("读取响应失败: {}", e))?
-            > 0
-        {
-            json_str.push_str(&line);
-            line.clear();
-        }
-        let resp: serde_json::Value =
-            serde_json::from_str(&json_str).map_err(|e| format!("解析响应失败: {}", e))?;
-        let content = resp["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        println!("{}", content);
-        Ok(content)
-    } else {
-        Err(format!("未知的响应格式: {}", &first_line))
+    // 一次性 JSON（部分代理不认 stream=true）
+    if first_line.starts_with('{') {
+        return read_plain_json(&mut reader, first_line);
     }
+
+    // 不是 SSE 也不是 JSON：报错时只截一小段，避免把整页 HTML 刷到屏幕上
+    if sse_data(&first_line).is_none() {
+        return Err(format!("未知的响应格式: {}", preview(first_line.trim(), 80)));
+    }
+
+    interrupt::install();
+    let outcome = stream_sse(
+        &mut reader,
+        &first_line,
+        interrupt::take,
+        |content| {
+            print!("{}", content);
+            io::stdout().flush().ok();
+        },
+        |reasoning| {
+            print!("{}", ansi("thinking", reasoning));
+            io::stdout().flush().ok();
+        },
+    );
+    interrupt::uninstall();
+
+    println!();
+    outcome
 }
 
 // ======================== 聊天循环 ========================
@@ -729,10 +1155,16 @@ fn run_chat(config: &Config, messages: &mut Vec<Message>, mut conv: Conversation
         io::stdout().flush().ok();
 
         let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap_or_else(|e| {
+        let read = io::stdin().read_line(&mut input).unwrap_or_else(|e| {
             eprintln!("{} 读取输入失败: {}", ansi("error", "错误"), e);
             0
         });
+
+        // stdin 结束（Ctrl+Z / 管道读完）：不要空转，直接退出
+        if read == 0 {
+            println!("{} 输入结束，退出对话", ansi("system", "→"));
+            break;
+        }
 
         let input = input.trim().to_string();
 
@@ -760,21 +1192,33 @@ fn run_chat(config: &Config, messages: &mut Vec<Message>, mut conv: Conversation
         // 发送请求
         println!("{} ", ansi(col, &format!("{}:", config.personality.name)));
         match send_chat(config, &context) {
-            Ok(response) => {
-                if response.is_empty() {
-                    messages.pop(); // 移除无效的用户消息
-                    println!("{} AI 返回了空响应，请重试", ansi("error", "⚠"));
+            Ok(outcome) => {
+                if outcome.content.is_empty() {
+                    // 移除无效的用户消息
+                    messages.pop();
+                    if outcome.interrupted {
+                        println!("{} 已中断，还没收到内容", ansi("system", "→"));
+                    } else {
+                        println!("{} AI 返回了空响应，请重试", ansi("error", "⚠"));
+                    }
                     continue;
+                }
+                if outcome.interrupted {
+                    println!(
+                        "{} 已中断，保留已收到的 {} 个字符",
+                        ansi("system", "→"),
+                        outcome.content.chars().count()
+                    );
                 }
                 messages.push(Message {
                     role: "assistant".to_string(),
-                    content: response.clone(),
+                    content: outcome.content.clone(),
                 });
                 conv.updated_at = now_timestamp();
                 conv.messages = messages.clone();
 
-                // 自动保存（始终写同一个文件）
-                if config.chat.auto_save {
+                // 自动保存（始终写同一个文件）；被中断的半截回复也落盘，否则 --continue 看不到
+                if config.chat.auto_save || outcome.interrupted {
                     save_conversation(&mut conv);
                 }
             }
@@ -1012,6 +1456,7 @@ fn main() {
         }
         "--continue" | "-C" => {
             let config = load_config(persona_ref);
+            ensure_config_ready(&config, &config_file_for(persona_ref));
             // 训练经验在这里也要注入，否则续聊时 /train 记录等于白记
             let system_prompt = build_system_prompt(&config);
             match get_latest_conversation() {
@@ -1072,6 +1517,7 @@ fn main() {
         }
         "" => {
             let config = load_config(persona_ref);
+            ensure_config_ready(&config, &config_file_for(persona_ref));
             let mut messages = vec![Message {
                 role: "system".to_string(),
                 content: build_system_prompt(&config),
@@ -1202,5 +1648,230 @@ mod tests {
     #[test]
     fn system_prompt_without_training_equals_base() {
         assert_eq!(compose_system_prompt("人格", &[]), "人格");
+    }
+
+    // ---------- 配置缺省值 ----------
+
+    const MINIMAL_CONFIG: &str = r#"
+[api]
+endpoint = "https://example.com/v1/chat/completions"
+key = "sk-test"
+model = "test-model"
+"#;
+
+    #[test]
+    fn config_without_personality_and_chat_tables_uses_defaults() {
+        // 验收项：删掉整段 [chat]、[personality] 仍能启动并落默认值
+        let cfg: Config = toml::from_str(MINIMAL_CONFIG).expect("缺 [chat]/[personality] 也要能解析");
+        assert!(cfg.chat.auto_save, "auto_save 缺省 true");
+        assert_eq!(cfg.chat.max_context, DEFAULT_MAX_CONTEXT);
+        assert_eq!(cfg.personality.name, "朋友");
+        assert_eq!(cfg.personality.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(cfg.personality.system_prompt, default_system_prompt());
+        assert!(cfg.personality.greeting.is_empty(), "问候语缺省为空");
+    }
+
+    #[test]
+    fn config_partial_chat_table_fills_only_missing_fields() {
+        let toml_str = r#"
+[api]
+endpoint = "http://127.0.0.1:1/v1"
+key = "k"
+
+[chat]
+max_context = 5
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.chat.auto_save, "缺 auto_save 时用 true");
+        assert_eq!(cfg.chat.max_context, 5, "写了的字段不被覆盖");
+        assert_eq!(cfg.api.model, DEFAULT_MODEL, "model 缺省");
+        assert_eq!(cfg.personality.temperature, DEFAULT_TEMPERATURE);
+    }
+
+    #[test]
+    fn config_missing_key_parses_then_fails_startup_check() {
+        // key 现在可以缺省（解析不报错），但启动校验必须拦住
+        let toml_str = "[api]\nendpoint = \"https://example.com/v1\"\nmodel = \"m\"\n";
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let problems = config_problems(&cfg);
+        assert!(
+            problems.iter().any(|p| p.contains("key 为空")),
+            "应提示 key 为空: {:?}",
+            problems
+        );
+    }
+
+    #[test]
+    fn config_problems_check_endpoint_temperature_and_context() {
+        let mut cfg = default_config();
+        cfg.api.key = "sk-x".to_string();
+        assert!(config_problems(&cfg).is_empty(), "默认配置 + 有 key 应无问题");
+
+        cfg.api.endpoint = "api.example.com/v1".to_string();
+        assert!(config_problems(&cfg)
+            .iter()
+            .any(|p| p.contains("http://") && p.contains("https://")));
+
+        cfg.api.endpoint = "https://api.example.com/v1".to_string();
+        cfg.personality.temperature = 3.0;
+        assert!(config_problems(&cfg)
+            .iter()
+            .any(|p| p.contains("temperature")));
+
+        cfg.personality.temperature = 0.8;
+        cfg.chat.max_context = 0;
+        assert!(config_problems(&cfg)
+            .iter()
+            .any(|p| p.contains("max_context")));
+
+        cfg.chat.max_context = 30;
+        cfg.api.model = "  ".to_string();
+        assert!(config_problems(&cfg)
+            .iter()
+            .any(|p| p.contains("model 为空")));
+    }
+
+    #[test]
+    fn format_config_error_reports_line_and_missing_field() {
+        // 缺 endpoint（必填字段）→ toml 报 missing field，报告里要带位置与字段提示
+        let content = "[api]\nkey = \"x\"\n";
+        let err = toml::from_str::<Config>(content).unwrap_err();
+        let report = format_config_error(content, &err, Path::new("C:/tmp/config.toml")).join("\n");
+        assert!(report.contains("missing field"), "{}", report);
+        assert!(report.contains("第 1 行"), "{}", report);
+        assert!(report.contains("C:/tmp/config.toml"), "{}", report);
+        assert!(report.contains("缺哪个 section/字段"), "{}", report);
+    }
+
+    #[test]
+    fn line_col_counts_from_one() {
+        let content = "a\nbb\nccc";
+        assert_eq!(line_col(content, 0), (1, 1));
+        assert_eq!(line_col(content, 2), (2, 1));
+        assert_eq!(line_col(content, 5), (3, 1));
+        assert_eq!(line_col(content, 7), (3, 3));
+        assert_eq!(line_col(content, 999), (3, 4), "越界按末尾算");
+    }
+
+    /// 只在临时目录确实可写时才跑文件测试（受限沙箱里 %TEMP% 可能不可写）
+    fn scratch_dir(tag: &str) -> Option<PathBuf> {
+        let dir = std::env::temp_dir().join(format!("friend-test-{}-{}", tag, process::id()));
+        fs::create_dir_all(&dir).ok()?;
+        fs::write(dir.join(".probe"), b"ok").ok()?;
+        Some(dir)
+    }
+
+    #[test]
+    fn write_atomic_replaces_target_and_leaves_no_tmp() {
+        let dir = match scratch_dir("atomic") {
+            Some(d) => d,
+            None => {
+                eprintln!("跳过：临时目录不可写");
+                return;
+            }
+        };
+        let path = dir.join("config.toml");
+        fs::write(&path, "old-content").unwrap();
+        write_atomic(&path, "new-content").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new-content");
+        assert!(!tmp_path(&path).exists(), "临时文件应已改名消失");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---------- SSE 容错 ----------
+
+    #[test]
+    fn sse_data_accepts_optional_space_and_ignores_other_lines() {
+        assert_eq!(sse_data("data: {\"a\":1}\r\n"), Some("{\"a\":1}"));
+        assert_eq!(sse_data("data:{\"a\":1}\n"), Some("{\"a\":1}"), "无空格也要认");
+        assert_eq!(sse_data("data: [DONE]"), Some("[DONE]"));
+        assert_eq!(sse_data("data:"), Some(""));
+        assert_eq!(sse_data(": keep-alive"), None, "注释行跳过");
+        assert_eq!(sse_data("event: message"), None, "event 字段跳过");
+        assert_eq!(sse_data("id: 42"), None);
+        assert_eq!(sse_data(""), None);
+        assert_eq!(sse_data("   "), None);
+    }
+
+    /// 拆成「首行 + 其余」喂给 stream_sse（真实调用就是这么进来的）
+    fn run_stream<F: FnMut() -> bool>(payload: &str, stop: F) -> StreamOutcome {
+        let mut lines = payload.lines();
+        let first = format!("{}\n", lines.next().unwrap_or(""));
+        let rest: String = lines.map(|l| format!("{}\n", l)).collect();
+        let mut reader = BufReader::new(rest.as_bytes());
+        stream_sse(&mut reader, &first, stop, |_| {}, |_| {}).unwrap()
+    }
+
+    #[test]
+    fn stream_sse_normal_path_collects_content_reasoning_and_stops_at_done() {
+        let payload = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n",
+            "\n",
+            ": keep-alive\n",
+            "event: message\n",
+            "data:{\"choices\":[{\"delta\":{\"content\":\"好\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"先想想\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+            "data: [DONE]\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"[DONE] 之后不该被读到\"}}]}\n",
+        );
+        let outcome = run_stream(payload, || false);
+        assert_eq!(outcome.content, "你好", "正常流式内容不能因为容错而丢");
+        assert_eq!(outcome.reasoning, "先想想");
+        assert!(!outcome.interrupted);
+    }
+
+    #[test]
+    fn stream_sse_reports_interrupt_and_keeps_partial_text() {
+        // 第一次检查不中断、第二次也不中断，第三次中断 → 只保留前两块
+        let payload = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"开头\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"前半\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"后半\"}}]}\n",
+        );
+        let mut checks = 0;
+        let outcome = run_stream(payload, move || {
+            checks += 1;
+            checks > 2
+        });
+        assert!(outcome.interrupted, "中断标志要带出来");
+        assert_eq!(outcome.content, "开头前半");
+        assert!(!outcome.content.contains("后半"));
+    }
+
+    #[test]
+    fn stream_sse_skips_malformed_json_without_failing() {
+        let payload = concat!(
+            "data: not-json\n",
+            "data: {\"choices\":[]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n",
+            "data: [DONE]\n",
+        );
+        let outcome = run_stream(payload, || false);
+        assert_eq!(outcome.content, "ok");
+        assert!(!outcome.interrupted);
+    }
+
+    #[test]
+    fn stream_sse_ending_without_done_returns_what_it_got() {
+        let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"半截\"}}]}\n";
+        let outcome = run_stream(payload, || false);
+        assert_eq!(outcome.content, "半截");
+        assert!(!outcome.interrupted, "连接提前结束不等于被中断");
+    }
+
+    #[test]
+    fn transport_errors_are_cleaned_and_recognized_as_timeout() {
+        // ureq 会把 Network Error 前缀叠两层，界面上只留一层原因
+        let raw = "Network Error: Network Error: Error encountered in the status line: 由于连接方在一段时间后没有正确答复 (os error 10060)";
+        let cleaned = clean_transport_error(raw);
+        assert!(!cleaned.starts_with("Network Error"), "{}", cleaned);
+        assert!(cleaned.contains("10060"), "{}", cleaned);
+        assert!(looks_like_timeout(&cleaned), "10060 要判定为超时");
+        assert!(looks_like_timeout("operation timed out"));
+        assert!(looks_like_timeout("连接超时"));
+        assert!(!looks_like_timeout("400 Bad Request"));
+        assert_eq!(os_error_code(&cleaned).as_deref(), Some("10060"));
+        assert_eq!(os_error_code("no code here"), None);
     }
 }

@@ -1,6 +1,6 @@
 # friend - AI 聊天助手
 
-版本: v1.0.1
+版本: v1.1.0
 
 ## 简介
 
@@ -11,6 +11,10 @@
 - [x] 自定义 AI API 接入（兼容 OpenAI Chat API 格式）
 - [x] 人格设定（系统提示词 + 温度参数）
 - [x] 流式输出（实时显示回复）
+- [x] SSE 容错：`data:{...}` 无空格可解析，空行 / `:` 注释 / `event:` 等字段跳过，坏 JSON 块跳过，`reasoning_content` 暗色单独显示
+- [x] 请求超时（连接 10 秒 / 读取 60 秒）与中文超时提示
+- [x] 回复中 Ctrl+C 中断，已收到的内容保留并落盘
+- [x] 配置容错：`[personality]` / `[chat]` 整段可省（自动落默认值），key / endpoint 有问题在首条消息发出前就提示，配置按「临时文件 + 改名替换」原子写入
 - [x] 对话历史保存/继续
 - [x] 训练反馈（记录纠正数据，逐步改进回复风格）
 - [x] 命令行交互（快捷键和命令）
@@ -42,12 +46,14 @@ greeting = "你好呀～"       # 开场问候语（可留空）
 system_prompt = """
 你是一个温暖真诚的朋友...
 """
-temperature = 0.8         # 回复随机性 (0.0-1.0)
+temperature = 0.8         # 回复随机性 (0.0-2.0)
 
 [chat]
 auto_save = true           # 自动保存对话
 max_context = 30           # 保留的上下文轮数
 ```
+
+`[personality]`、`[chat]` 两段可以整段删掉，缺的字段自动落默认值：`name = "朋友"`、`greeting = ""`、`temperature = 0.8`、`auto_save = true`、`max_context = 30`、`model = "gpt-4o-mini"`。`[api] key` 留空或 `endpoint` 不是 `http(s)://` 开头时，启动就会给中文提示并退出（不会等到 401 才发现）；配置解析失败会打印出错的行号、列号与原文，并且原配置文件字节不变。
 
 ### 运行
 
@@ -74,6 +80,13 @@ friend --edit-config
 | `/clear` | 清屏 |
 | `/train <反馈>` | 纠正上一条回复，记录训练数据 |
 | `/help` | 显示帮助 |
+
+### 交互说明
+
+- **Ctrl+C 中断**：在 AI 回复过程中按 Ctrl+C，会中止本次回复，已经收到的字符会保留并立即保存（即使 `auto_save = false`），随后回到「你:」提示符；之后 `friend --continue` 能看到这段半截回复。不在回复期间时，Ctrl+C 仍是系统默认行为（直接退出进程）。
+- **中断生效时机**：流式读取每收到一行数据前都会检查中断标志，所以正常逐字输出时按下立即生效；若服务端中途长时间不发数据，最多要等到下一块数据或 60 秒读取超时才生效（同步 HTTP 无法打断阻塞中的 socket 读，这是刻意取舍，不引入线程池/tokio）。
+- **超时默认值**：连接 10 秒、单次读取 60 秒（`CONNECT_TIMEOUT_SECS` / `READ_TIMEOUT_SECS`），服务端 60 秒没有新数据会打印中文超时提示并回到提示符，不会卡住整个进程。
+- **SSE 容错**：`data:{...}`（无空格）也能识别，空行 / `:` 开头的注释 / `event:`、`id:` 等字段跳过，单个坏 JSON 块跳过不影响整段回复，`finish_reason` 与 `data: [DONE]` 都作为结束信号；`reasoning_content` 用暗灰色单独输出。
 
 ### 训练机制
 
@@ -133,12 +146,15 @@ cargo install --path friend
 - **配置路径固定**：`~/.tao_tools/friend/config.toml`（首次运行生成模板），对话历史落在同目录；路径必须走 `dirs`，不硬编码盘符
 - **会话一文件**：会话落盘为 `conversations/<id>.json`，`id` = 创建时刻 + 进程号；自动保存始终覆盖同一个文件，`--list` 按 `id` 去重，v1.0.0 的旧文件在加载时用文件名补齐 `id`
 - **密钥不入库**：API Key 只从配置文件读，不写进代码，不提交到仓库（根 `.gitignore` 已排除 `API.txt`）
+- **超时与中断**：请求统一走 `chat_agent()`（`timeout_connect(10s)` / `timeout_read(60s)`）；Ctrl+C 只在流式读取期间用 kernel32 `SetConsoleCtrlHandler` 接管（`AtomicBool` 置位，流式循环每读一行前 `interrupt::take()` 检查），退出流式立即卸载 handler，平时保持系统默认
+- **配置写入是原子替换**：写 `config.toml.tmp` 再 rename；缺段/缺字段由 `#[serde(default = ...)]` 补默认值，启动校验集中在 `config_problems()`（key 空、endpoint 非 http(s)、model 空、temperature 越界、max_context 为 0）
+- **SSE 解析纯手写**：`sse_data` 抽行、`stream_sse` 逐行消费，坏块跳过；为了不引新 crate，没有用事件流库或 tokio
 - **训练机制是本地拼装**：靠系统提示词 + 历史修正实现人格，不发额外训练请求，改动它时要注意 prompt 体积
 
 ## 开发进度 / 开发计划
 
-- 已完成：v1.0.1 —— 自定义 API 接入、人格训练、终端对话、历史会话管理；一次会话只落一个文件，`--list`/`--continue` 预览按字符截断不再 panic，续聊也会带上训练的 `[经验]`
-- 下一步：配置缺省值与启动校验（v1.0.2）→ 流式超时/中断（v1.1.0）→ Anthropic API
+- 已完成：v1.1.0 —— 在 v1.0.1 基础上补齐配置缺省值与启动校验（含配置原子写入）、流式请求超时 / 可中断 / SSE 容错
+- 下一步：Anthropic API（v1.2.0）→ 对话导出 / 多人格（v1.3.0）→ 训练参数细化（v1.4.0）
 - 计划、优先级与验收标准见 [plans/friend.md](../../plans/friend.md)
 
 ## 项目日志
